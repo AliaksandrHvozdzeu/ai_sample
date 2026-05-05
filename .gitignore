@@ -1,0 +1,27 @@
+# Virtual environment (never commit; recreate with py -m venv .venv)
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local RAG / downloads (large; optional: keep json/ tracked, ignore only if you prefer)
+chroma_db/
+
+# Hugging Face / PyTorch cache (optional: set HF_HOME inside .venv to project dir)
+# .cache/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store

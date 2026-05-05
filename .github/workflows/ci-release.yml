@@ -1,0 +1,97 @@
+# Runs pytest on every PR/push to main or master.
+# On push to main/master only (e.g. after merging develop), builds gan-ai-<version> bundle and creates a GitHub Release.
+
+name: CI and gan-ai release
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest
+
+  release-bundle:
+    name: Package gan-ai bundle & GitHub Release
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run pytest (release gate)
+        run: pytest
+
+      - name: Build gan-ai bundle (version = 0.1.${{ github.run_number }})
+        id: bundle
+        run: |
+          VERSION="0.1.${{ github.run_number }}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          python package_gan_ai.py \
+            --family gan-ai \
+            --version "${VERSION}" \
+            --include-app \
+            --include-json \
+            --include-packager \
+            --zip
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gan-ai-${{ steps.bundle.outputs.version }}-bundle
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gan-ai-v${{ steps.bundle.outputs.version }}
+          name: gan-ai ${{ steps.bundle.outputs.version }}
+          body: |
+            Automated **gan-ai** RAG bundle (`manifest.json`, `MODEL_CARD.md`, app + JSON when present).
+
+            Trigger: push to **master** / **main** (for example after merging **develop**).
+
+            Artifact: `dist/gan-ai-${{ steps.bundle.outputs.version }}.zip`
+          files: dist/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
