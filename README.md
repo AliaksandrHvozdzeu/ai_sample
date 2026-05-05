@@ -21,6 +21,22 @@ This project runs **on your computer**. It reads text from JSON files, saves a s
 | `app.py` | Main program: index + chat. |
 | `requirements.txt` | Python libraries to install. |
 | `package_gan_ai.py` | Optional script to pack a **release bundle** (manifest + files). |
+| `config.yaml` | **Optional.** Change folders, retrieval `top_k`, or system prompt **without editing Python**. |
+| `web/server.py` | **FastAPI** app: browser UI + **streaming** answers (SSE). |
+| `Dockerfile` / `docker-compose.yml` | Run the web app in Docker with a **volume for Chroma**. |
+
+---
+
+## Why this repo is a bit special (for your portfolio)
+
+These ideas are simple, but interviewers like **clear settings** and **honest RAG** (you show what the model actually saw):
+
+- **`config.yaml`** — paths, how many chunks to retrieve (`top_k`), and the system prompt in one place.
+- **`--show-sources`** — before each answer, the app can print **which files / chunks** were retrieved (transparency).
+- **`--query "..."`** — one question and exit (good for **demos**, scripts, or screen recordings).
+- **`--top-k`** — quick experiment: more chunks = more context (but also more noise).
+- **Web UI** — chat in the browser with **token streaming** (not only the terminal).
+- **Docker Compose** — optional **one-command** setup with a **persistent Chroma volume**.
 
 ---
 
@@ -111,12 +127,117 @@ Default model is **Qwen2.5 1.5B Instruct**. You can switch to the heavier option
 python app.py --model unsloth/Llama-3.2-3B-Instruct
 ```
 
+### One question only (demo mode)
+
+```bash
+python app.py --query "What is the office Wi-Fi network name?"
+```
+
+### Show where the answer came from (retrieved chunks)
+
+```bash
+python app.py --show-sources
+python app.py --query "Your question" --show-sources
+```
+
+### Custom config file
+
+```bash
+python app.py --config my_settings.yaml
+```
+
+If you **do not** pass `--config`, the app loads **`config.yaml`** automatically **when that file exists** next to `app.py`.
+
+### More chunks from the index (optional)
+
+```bash
+python app.py --top-k 6
+```
+
 ### Important behaviour
 
 The assistant is told to answer **only** from the retrieved document text.  
 If the answer is not there, it should say exactly:
 
 **`I could not find this in the documents.`**
+
+---
+
+## Web UI (browser + streaming)
+
+After you install libraries and build the index (`python app.py --reindex`), start the server:
+
+```bash
+uvicorn web.server:app --host 127.0.0.1 --port 8000
+```
+
+Open **http://127.0.0.1:8000** in your browser. Type a question and press **Send**. You should see the answer appear **word by word** (streaming).
+
+- Turn on **Show sources** to see which JSON chunks were used (same idea as `--show-sources` in the terminal).
+- Check **http://127.0.0.1:8000/api/health** if something fails (for example missing Chroma index).
+
+**Environment variables (optional):**
+
+| Variable | Meaning |
+|----------|---------|
+| `RAG_MODEL_ID` | Same choices as CLI (`Qwen/...` or `unsloth/Llama-3.2-3B-Instruct`). |
+| `RAG_CONFIG` | Full path to a YAML config file (if you do not use the default `config.yaml`). |
+
+**Note:** The first request can be slow while the model loads into VRAM.
+
+---
+
+## Docker Compose (one command)
+
+You need **Docker** and **Docker Compose** installed.
+
+### Basic idea
+
+- **`docker-compose.yml`** starts the **web UI** on port **8000**.
+- Folder **`json/`** on your PC is mounted into the container (**read-only**).
+- Chroma is stored in a **named volume** called **`chroma_data`** so it **does not disappear** when you restart the container.
+
+### Typical workflow
+
+1. Put JSON files in **`json/`** on your machine (same as before).
+2. On your machine (with GPU if possible), build the index once:
+
+   ```bash
+   python app.py --reindex
+   ```
+
+3. Start Docker:
+
+   ```bash
+   docker compose up --build
+   ```
+
+4. Open **http://localhost:8000**.
+
+If the browser shows an error, open **http://localhost:8000/api/health**.  
+Often the problem is: **the container has an empty Chroma folder**. The named volume starts **empty**. You can fix it in two ways:
+
+- **Bind mount your host folder** (easy when you already ran `--reindex` on the host):
+
+  ```bash
+  cp docker-compose.override.example.yml docker-compose.override.yml
+  ```
+
+  Then edit paths if needed and run `docker compose up --build` again.  
+  (`docker-compose.override.yml` is in `.gitignore` so it stays local.)
+
+- Or **copy** your host `./chroma_db` into the volume (more advanced).
+
+### GPU inside Docker
+
+You need the **NVIDIA Container Toolkit** on Linux/WSL2 (or similar on Windows). Then run Compose with GPU access, for example:
+
+```bash
+docker compose up --build
+```
+
+and enable GPU for the service (exact flags depend on your Docker version).  
+If the container runs on **CPU only**, loading the **4-bit** model may fail or be very slow — the README cannot replace your GPU driver docs.
 
 ---
 

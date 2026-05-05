@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.idea
+.vscode
+dist
+*.zip
+chroma_db
+.hf_cache
+*.md
+!README.md

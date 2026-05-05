@@ -128,3 +128,29 @@ class TestParseArgs:
             args = rag.parse_args()
             assert args.model == rag.DEFAULT_LLM_ID
             assert args.reindex is False
+            assert args.query is None
+            assert args.show_sources is False
+
+
+class TestWebHelpers:
+    def test_serialize_sources_shape(self) -> None:
+        from langchain_core.documents import Document
+
+        docs = [
+            Document(
+                page_content="hello world",
+                metadata={"source_file": "a.json", "title": "T"},
+            )
+        ]
+        ser = rag.serialize_sources_for_ui(docs)
+        assert len(ser) == 1
+        assert ser[0]["source_file"] == "a.json"
+
+
+class TestConfigHelpers:
+    def test_load_missing_config_is_empty(self, tmp_path: Path) -> None:
+        assert rag.load_app_config_file(tmp_path / "does-not-exist.yaml") == {}
+
+    def test_resolve_config_explicit(self) -> None:
+        p = Path("/tmp/x.yaml")
+        assert rag.resolve_config_path(p) == p

@@ -1,0 +1,20 @@
+# Local RAG — optional configuration (edit paths / prompt without touching Python).
+# If this file is missing, app.py uses built-in defaults.
+
+paths:
+  json_dir: json
+  chroma_db: chroma_db
+
+models:
+  embedding: sentence-transformers/all-MiniLM-L6-v2
+
+retrieval:
+  # How many JSON chunks to retrieve for each question (trade-off: noise vs recall)
+  top_k: 4
+
+prompt:
+  system: |
+    You are a precise corporate assistant. Answer questions STRICTLY using only the provided document context below (from JSON).
+    Do not invent facts or use outside knowledge.
+    If the answer is not in the context, reply exactly: I could not find this in the documents.
+    If the fragment metadata includes a source (title or URL), mention it briefly at the end of your answer.

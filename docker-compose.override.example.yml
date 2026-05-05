@@ -1,0 +1,11 @@
+# Copy to docker-compose.override.yml to use your host Chroma folder instead of the named volume:
+#
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#
+# Then `docker compose up` mounts ./chroma_db into the container.
+
+services:
+  rag-web:
+    volumes:
+      - ./json:/app/json:ro
+      - ./chroma_db:/app/chroma_db

@@ -22,7 +22,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 # LangChain: classic package holds retrieval chains; fallback supports older langchain installs.
 from langchain_core.messages import BaseMessage
@@ -45,8 +45,13 @@ from transformers import (
     pipeline,
 )
 
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore
+
 # -----------------------------------------------------------------------------
-# Paths and model IDs (edit here if you change folders or models)
+# Paths and model IDs (defaults; can be overridden by config.yaml)
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 JSON_DIR = BASE_DIR / "json"  # input: all *.json files here are indexed
@@ -56,14 +61,62 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # fast local embeddi
 DEFAULT_LLM_ID = "Qwen/Qwen2.5-1.5B-Instruct"  # default instruct model (lighter)
 ALT_LLM_ID = "unsloth/Llama-3.2-3B-Instruct"  # alternative instruct model (heavier)
 
+RETRIEVAL_TOP_K = 4  # chunks to retrieve; overridden by config.yaml or --top-k
+
 # Instructions to the LLM: must stay grounded; exact phrase when context is insufficient.
-SYSTEM_PROMPT = """You are a precise corporate assistant. Answer questions STRICTLY using only the provided document context below (from JSON). \
+_SYSTEM_PROMPT_DEFAULT = """You are a precise corporate assistant. Answer questions STRICTLY using only the provided document context below (from JSON). \
 Do not invent facts or use outside knowledge. \
 If the answer is not in the context, reply exactly: I could not find this in the documents. \
 If the fragment metadata includes a source (title or URL), mention it briefly at the end of your answer."""
+SYSTEM_PROMPT = _SYSTEM_PROMPT_DEFAULT
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def load_app_config_file(path: Path | None) -> dict[str, Any]:
+    """Load optional YAML config. Returns {} if missing or PyYAML not installed."""
+    if path is None or not path.is_file():
+        return {}
+    if yaml is None:
+        logger.warning("Install PyYAML to use --config / config.yaml: pip install pyyaml")
+        return {}
+    with path.open(encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def apply_app_config(cfg: dict[str, Any]) -> None:
+    """
+    Merge YAML settings into module-level paths and prompts (no need to fork app.py for new folders).
+    """
+    global JSON_DIR, CHROMA_DIR, EMBEDDING_MODEL, SYSTEM_PROMPT, RETRIEVAL_TOP_K
+
+    paths = cfg.get("paths") or {}
+    if isinstance(paths.get("json_dir"), str) and paths["json_dir"].strip():
+        JSON_DIR = (BASE_DIR / paths["json_dir"].strip()).resolve()
+    if isinstance(paths.get("chroma_db"), str) and paths["chroma_db"].strip():
+        CHROMA_DIR = (BASE_DIR / paths["chroma_db"].strip()).resolve()
+
+    models = cfg.get("models") or {}
+    if isinstance(models.get("embedding"), str) and models["embedding"].strip():
+        EMBEDDING_MODEL = models["embedding"].strip()
+
+    retrieval = cfg.get("retrieval") or {}
+    if retrieval.get("top_k") is not None:
+        RETRIEVAL_TOP_K = max(1, int(retrieval["top_k"]))
+
+    prompt = cfg.get("prompt") or {}
+    if isinstance(prompt.get("system"), str) and prompt["system"].strip():
+        SYSTEM_PROMPT = prompt["system"].strip()
+
+
+def resolve_config_path(cli_path: Path | None) -> Path | None:
+    """Use explicit --config, else config.yaml next to app.py if it exists."""
+    if cli_path is not None:
+        return cli_path
+    default_yaml = BASE_DIR / "config.yaml"
+    return default_yaml if default_yaml.is_file() else None
 
 
 def _log_pytorch_cuda() -> None:
@@ -288,7 +341,7 @@ def build_vectorstore(documents: Iterable[Document], persist_dir: Path, clear: b
 
     docs_list = list(documents)
     if not docs_list:
-        raise ValueError("No documents to index. Check JSON files in ./json/.")
+        raise ValueError(f"No documents to index. Check JSON files in {JSON_DIR}.")
 
     # from_documents: embeds each Document.page_content and stores vectors + metadata on disk
     vs = Chroma.from_documents(
@@ -425,16 +478,17 @@ def make_llm_runnable(tokenizer, pipe):
     return RunnableLambda(_generate)
 
 
-def build_retrieval_chain(vectorstore: Chroma, tokenizer, pipe):
+def build_retrieval_chain(vectorstore: Chroma, tokenizer, pipe, *, top_k: int | None = None):
     """
     Wire retrieval + generation:
-      1. Retriever: vector similarity search, top-k chunks (k=4).
+      1. Retriever: vector similarity search, top-k chunks.
       2. create_stuff_documents_chain: concatenate chunks into one {context} string.
       3. create_retrieval_chain: user question -> retrieve -> combine -> LLM -> answer.
 
     Invocation returns a dict; we read "answer" in run_chat().
     """
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    k = top_k if top_k is not None else RETRIEVAL_TOP_K
+    retriever = vectorstore.as_retriever(search_kwargs={"k": k})
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", SYSTEM_PROMPT),
@@ -445,9 +499,121 @@ def build_retrieval_chain(vectorstore: Chroma, tokenizer, pipe):
     return create_retrieval_chain(retriever, combine_docs_chain)
 
 
-def run_chat(chain) -> None:
+def retrieve_context_documents(
+    vectorstore: Chroma,
+    question: str,
+    *,
+    top_k: int | None = None,
+) -> list[Document]:
+    """Same retrieval policy as build_retrieval_chain (for API streaming without duplicating chain wiring)."""
+    k = top_k if top_k is not None else RETRIEVAL_TOP_K
+    retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+    return retriever.invoke(question)
+
+
+def documents_context_string(documents: list[Document]) -> str:
+    """Join retrieved chunk texts for the LLM context window."""
+    return "\n\n".join(d.page_content for d in documents)
+
+
+def build_hf_chat_messages(user_question: str, context: str) -> list[dict[str, str]]:
+    """HF chat turns for apply_chat_template (must stay aligned with make_llm_runnable)."""
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Document context:\n{context}\n\n"
+                f"Question: {user_question}"
+            ),
+        },
+    ]
+
+
+def build_chat_prompt_text(tokenizer: Any, user_question: str, context: str) -> str:
+    """Single prompt string passed to the small LM (streaming + non-streaming)."""
+    msgs = build_hf_chat_messages(user_question, context)
+    return tokenizer.apply_chat_template(
+        msgs,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def serialize_sources_for_ui(documents: list[Document]) -> list[dict[str, Any]]:
+    """Compact JSON for the web UI / SSE \"sources\" event."""
+    out: list[dict[str, Any]] = []
+    for d in documents:
+        meta = d.metadata or {}
+        out.append(
+            {
+                "source_file": meta.get("source_file"),
+                "label": meta.get("source_title")
+                or meta.get("title")
+                or meta.get("question"),
+                "preview": (d.page_content or "")[:240].replace("\n", " "),
+            }
+        )
+    return out
+
+
+def iter_answer_tokens_stream(tokenizer: Any, pipe: Any, prompt_text: str) -> Iterator[str]:
+    """
+    Stream decoded fragments while the quantized model generates (for FastAPI SSE).
+    Uses TextIteratorStreamer + background generate on the pipeline's underlying model.
+    """
+    from threading import Thread
+
+    from transformers import TextIteratorStreamer
+
+    model = pipe.model
+    enc = tokenizer(prompt_text, return_tensors="pt")
+    device = next(model.parameters()).device
+    enc = {k: v.to(device) for k, v in enc.items()}
+
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    def _worker() -> None:
+        try:
+            model.generate(**enc, streamer=streamer)
+        except Exception:
+            logger.exception("Streaming generation failed")
+            raise
+
+    Thread(target=_worker, daemon=True).start()
+    yield from streamer
+
+
+def _print_retrieved_sources(out: dict[str, Any]) -> None:
+    """Portfolio-style transparency: show which chunks were retrieved (file / title hints)."""
+    ctx = out.get("context")
+    if not ctx:
+        print("(No separate context list in chain output.)")
+        return
+    print("--- Retrieved sources (for transparency) ---")
+    if isinstance(ctx, list):
+        for i, doc in enumerate(ctx, 1):
+            meta = getattr(doc, "metadata", None) or {}
+            src = meta.get("source_file", "?")
+            label = (
+                meta.get("source_title")
+                or meta.get("title")
+                or meta.get("question")
+                or ""
+            )
+            preview = (getattr(doc, "page_content", "") or "")[:120].replace("\n", " ")
+            extra = f" — {preview}..." if preview else ""
+            print(f"  [{i}] file={src} | {str(label)[:60]}{extra}")
+    else:
+        print(f"  {ctx!r}")
+    print("---")
+
+
+def run_chat(chain, *, show_sources: bool = False) -> None:
     """Simple REPL: send {"input": question} into the retrieval chain and print the answer."""
     print("Local RAG (JSON). Type exit, quit, or Ctrl+C to leave.")
+    if show_sources:
+        print("(Showing retrieved sources before each answer.)")
     while True:
         try:
             q = input("\nYou: ").strip()
@@ -460,15 +626,35 @@ def run_chat(chain) -> None:
             break
         try:
             out = chain.invoke({"input": q})
+            if show_sources:
+                _print_retrieved_sources(out)
             answer = out.get("answer", out)
             print("Assistant:", answer)
         except Exception as e:
             logger.exception("Error while generating answer: %s", e)
 
 
+def run_single_query(chain, question: str, *, show_sources: bool) -> None:
+    """One-shot mode for scripts, demos, and CI (no interactive loop)."""
+    out = chain.invoke({"input": question})
+    if show_sources:
+        _print_retrieved_sources(out)
+    answer = out.get("answer", out)
+    print("Assistant:", answer)
+
+
 def parse_args():
     """CLI: --reindex rebuilds vectors; --model selects which HF instruct checkpoint to load."""
-    p = argparse.ArgumentParser(description="RAG over JSON files in ./json/")
+    p = argparse.ArgumentParser(
+        description="RAG over JSON files (paths and prompt can be set in config.yaml)."
+    )
+    p.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="YAML config file (default: config.yaml next to app.py if that file exists)",
+    )
     p.add_argument(
         "--reindex",
         action="store_true",
@@ -481,6 +667,25 @@ def parse_args():
         choices=(DEFAULT_LLM_ID, ALT_LLM_ID),
         help=f"Hugging Face model id (default: {DEFAULT_LLM_ID})",
     )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Override number of retrieved chunks (default: from config or 4)",
+    )
+    p.add_argument(
+        "--query",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help="Ask one question and exit (non-interactive; good for demos)",
+    )
+    p.add_argument(
+        "--show-sources",
+        action="store_true",
+        help="Print retrieved chunk summary before the assistant answer",
+    )
     return p.parse_args()
 
 
@@ -491,7 +696,16 @@ def main() -> None:
       else:    load Chroma from disk
       then:    load quantized LLM -> build retrieval chain -> interactive chat
     """
+    global RETRIEVAL_TOP_K
+
     args = parse_args()
+    cfg_path = resolve_config_path(args.config)
+    apply_app_config(load_app_config_file(cfg_path))
+    if cfg_path:
+        logger.info("Loaded config: %s", cfg_path)
+
+    if args.top_k is not None:
+        RETRIEVAL_TOP_K = max(1, int(args.top_k))
 
     if args.reindex:
         docs = load_json_documents(JSON_DIR)
@@ -509,8 +723,12 @@ def main() -> None:
 
     logger.info("Loading LLM %s (4-bit)...", args.model)
     tokenizer, pipe = build_llm_pipeline(args.model)
-    chain = build_retrieval_chain(vs, tokenizer, pipe)
-    run_chat(chain)
+    chain = build_retrieval_chain(vs, tokenizer, pipe, top_k=RETRIEVAL_TOP_K)
+
+    if args.query:
+        run_single_query(chain, args.query.strip(), show_sources=args.show_sources)
+    else:
+        run_chat(chain, show_sources=args.show_sources)
 
 
 if __name__ == "__main__":

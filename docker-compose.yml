@@ -1,0 +1,25 @@
+# Web UI on port 8000 + named Docker volume for Chroma (persists between runs).
+#
+# Before first chat: build the vector index (usually on your machine with GPU):
+#   python app.py --reindex
+# Then either:
+#   • Use the bind-mount override file docker-compose.override.yml.example (copy to docker-compose.override.yml), or
+#   • docker cp ./chroma_db/. <container>:/app/chroma_db/
+#
+# GPU: install NVIDIA Container Toolkit, then run:
+#   docker compose up --build
+# and pass GPU to the container (see README).
+
+services:
+  rag-web:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./json:/app/json:ro
+      - chroma_data:/app/chroma_db
+    environment:
+      RAG_MODEL_ID: ${RAG_MODEL_ID:-Qwen/Qwen2.5-1.5B-Instruct}
+
+volumes:
+  chroma_data:

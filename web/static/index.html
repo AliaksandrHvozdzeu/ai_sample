@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local RAG chat</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --accent: #3d8bfd;
+      --user: #243044;
+      --bot: #16202e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, Segoe UI, sans-serif;
+      background: var(--bg); color: var(--text);
+      min-height: 100vh; display: flex; flex-direction: column;
+    }
+    header {
+      padding: 1rem 1.25rem; border-bottom: 1px solid #2a3544;
+      background: var(--panel);
+    }
+    header h1 { margin: 0; font-size: 1.15rem; font-weight: 600; }
+    header p { margin: 0.35rem 0 0; font-size: 0.85rem; color: var(--muted); }
+    #chat {
+      flex: 1; overflow-y: auto; padding: 1rem;
+      max-width: 720px; width: 100%; margin: 0 auto;
+    }
+    .msg { margin-bottom: 1rem; padding: 0.75rem 1rem; border-radius: 10px; max-width: 95%; white-space: pre-wrap; line-height: 1.45; }
+    .msg.user { background: var(--user); margin-left: auto; }
+    .msg.bot { background: var(--bot); border: 1px solid #2a3544; }
+    .sources {
+      font-size: 0.75rem; color: var(--muted); margin-bottom: 0.5rem;
+      padding: 0.5rem 0.75rem; background: #121a24; border-radius: 8px; border: 1px dashed #334155;
+    }
+    #bar {
+      padding: 1rem; border-top: 1px solid #2a3544;
+      background: var(--panel); display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;
+      max-width: 720px; width: 100%; margin: 0 auto;
+    }
+    #inp {
+      flex: 1; min-width: 200px; padding: 0.65rem 0.85rem;
+      border-radius: 8px; border: 1px solid #334155; background: #0f1419; color: var(--text);
+      font-size: 1rem;
+    }
+    button {
+      padding: 0.65rem 1.1rem; border-radius: 8px; border: none;
+      background: var(--accent); color: #fff; font-weight: 600; cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    label { font-size: 0.85rem; color: var(--muted); display: flex; align-items: center; gap: 0.35rem; }
+    .typing { color: var(--muted); font-size: 0.8rem; margin-top: 0.25rem; }
+    .err { color: #f87171; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Local RAG</h1>
+    <p>Answers use your JSON index + small local model. Streaming tokens below.</p>
+  </header>
+  <div id="chat"></div>
+  <div id="bar">
+    <input id="inp" type="text" placeholder="Ask something…" autocomplete="off" />
+    <label><input type="checkbox" id="sources" /> Show sources</label>
+    <button id="send" type="button">Send</button>
+  </div>
+  <script>
+    const chat = document.getElementById('chat');
+    const inp = document.getElementById('inp');
+    const send = document.getElementById('send');
+    const showSources = document.getElementById('sources');
+
+    function addBubble(role, text, extraHtml) {
+      const wrap = document.createElement('div');
+      wrap.className = 'msg ' + role;
+      if (extraHtml) wrap.innerHTML = extraHtml + escapeHtml(text);
+      else wrap.textContent = text;
+      chat.appendChild(wrap);
+      chat.scrollTop = chat.scrollHeight;
+      return wrap;
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    async function streamAsk(q) {
+      send.disabled = true;
+      addBubble('user', q);
+      const botWrap = document.createElement('div');
+      botWrap.className = 'msg bot';
+      const answerDiv = document.createElement('div');
+      answerDiv.className = 'answer-body';
+      const typing = document.createElement('div');
+      typing.className = 'typing';
+      typing.textContent = 'Thinking…';
+      botWrap.appendChild(typing);
+      botWrap.appendChild(answerDiv);
+      chat.appendChild(botWrap);
+      let botText = '';
+
+      try {
+        const res = await fetch('/api/chat/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: q, show_sources: showSources.checked }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          typing.remove();
+          let msg = res.statusText;
+          if (err.detail) {
+            msg = Array.isArray(err.detail)
+              ? err.detail.map((x) => x.msg || JSON.stringify(x)).join(' ')
+              : String(err.detail);
+          }
+          answerDiv.innerHTML = '<span class="err">' + escapeHtml(msg) + '</span>';
+          return;
+        }
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buffer = '';
+        typing.textContent = 'Streaming…';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += dec.decode(value, { stream: true });
+          const blocks = buffer.split('\n\n');
+          buffer = blocks.pop() || '';
+          for (const block of blocks) {
+            if (!block.startsWith('data: ')) continue;
+            let data;
+            try {
+              data = JSON.parse(block.slice(6));
+            } catch (e) { continue; }
+            if (data.type === 'sources' && data.items) {
+              const lines = data.items.map(
+                (it) => '• ' + (it.source_file || '?') + ' — ' + (it.label || '').slice(0, 80)
+              );
+              const div = document.createElement('div');
+              div.className = 'sources';
+              div.textContent = 'Sources:\n' + lines.join('\n');
+              botWrap.insertBefore(div, typing);
+            }
+            if (data.type === 'token' && data.text) {
+              botText += data.text;
+              typing.remove();
+              answerDiv.textContent = botText;
+            }
+            if (data.type === 'error') {
+              typing.remove();
+              answerDiv.innerHTML = '<span class="err">' + escapeHtml(data.detail || 'Error') + '</span>';
+            }
+            if (data.type === 'done') {
+              typing.remove();
+            }
+          }
+        }
+        typing.remove();
+        if (!botText && !answerDiv.querySelector('.err')) {
+          answerDiv.textContent = '(empty reply)';
+        }
+      } catch (e) {
+        typing.remove();
+        answerDiv.innerHTML = '<span class="err">' + escapeHtml(String(e)) + '</span>';
+      } finally {
+        send.disabled = false;
+        inp.focus();
+      }
+    }
+
+    send.onclick = () => {
+      const q = inp.value.trim();
+      if (!q) return;
+      inp.value = '';
+      streamAsk(q);
+    };
+    inp.onkeydown = (e) => {
+      if (e.key === 'Enter') send.click();
+    };
+
+    fetch('/api/health')
+      .then((r) => r.json())
+      .then((j) => {
+        if (!j.ok && j.startup_error) {
+          const d = document.createElement('div');
+          d.className = 'err';
+          d.style.padding = '1rem';
+          d.textContent = 'Server issue: ' + j.startup_error;
+          chat.appendChild(d);
+        }
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>

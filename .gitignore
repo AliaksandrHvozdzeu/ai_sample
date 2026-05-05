@@ -18,6 +18,9 @@ chroma_db/
 # Hugging Face / PyTorch cache (optional: set HF_HOME inside .venv to project dir)
 # .cache/
 
+# Docker local overrides
+docker-compose.override.yml
+
 # IDE
 .idea/
 .vscode/
