@@ -4,6 +4,8 @@
 paths:
   json_dir: json
   chroma_db: chroma_db
+  # Obsidian-style Markdown vault (path relative to project root → ai_sample/vault/)
+  vault_dir: vault
 
 models:
   embedding: sentence-transformers/all-MiniLM-L6-v2
@@ -14,7 +16,7 @@ retrieval:
 
 prompt:
   system: |
-    You are a precise corporate assistant. Answer questions STRICTLY using only the provided document context below (from JSON).
+    You are a precise corporate assistant. Answer questions STRICTLY using only the provided document context below (JSON articles/FAQ and optional Markdown notes).
     Do not invent facts or use outside knowledge.
     If the answer is not in the context, reply exactly: I could not find this in the documents.
-    If the fragment metadata includes a source (title or URL), mention it briefly at the end of your answer.
+    If the fragment metadata includes a source (title, path, or URL), mention it briefly at the end of your answer.

@@ -4,13 +4,14 @@ Author: Hvozdzeu Aliaksandr, 2026, Vilnius.
 Local RAG (Retrieval-Augmented Generation) CLI application.
 
 What this script does (high level):
-  1. Loads structured records from JSON files in ./json/ (FAQ or article format).
+  1. Loads structured records from JSON files in ./json/ (FAQ or article format), and optionally
+     Markdown notes from an Obsidian vault path (set paths.vault_dir in config.yaml).
   2. Embeds each record with sentence-transformers and stores vectors in ChromaDB (./chroma_db/).
   3. At query time, retrieves the most similar chunks, injects them as "context", and runs a
      small local LLM (4-bit quantized) to answer in English, grounded on that context only.
 
 Run:
-  python app.py --reindex   # rebuild the vector index from JSON
+  python app.py --reindex   # rebuild the vector index from JSON + optional vault
   python app.py             # chat using the existing index
 """
 
@@ -20,6 +21,7 @@ import argparse
 import copy
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -56,6 +58,8 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 JSON_DIR = BASE_DIR / "json"  # input: all *.json files here are indexed
 CHROMA_DIR = BASE_DIR / "chroma_db"  # persisted Chroma vector database on disk
+# Optional Obsidian / Markdown vault (directory of *.md). Set paths.vault_dir in config.yaml.
+VAULT_DIR: Path | None = None
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # fast local embeddings for retrieval
 DEFAULT_LLM_ID = "Qwen/Qwen2.5-1.5B-Instruct"  # default instruct model (lighter)
@@ -64,10 +68,10 @@ ALT_LLM_ID = "unsloth/Llama-3.2-3B-Instruct"  # alternative instruct model (heav
 RETRIEVAL_TOP_K = 4  # chunks to retrieve; overridden by config.yaml or --top-k
 
 # Instructions to the LLM: must stay grounded; exact phrase when context is insufficient.
-_SYSTEM_PROMPT_DEFAULT = """You are a precise corporate assistant. Answer questions STRICTLY using only the provided document context below (from JSON). \
+_SYSTEM_PROMPT_DEFAULT = """You are a precise corporate assistant. Answer questions STRICTLY using only the provided document context below. \
 Do not invent facts or use outside knowledge. \
 If the answer is not in the context, reply exactly: I could not find this in the documents. \
-If the fragment metadata includes a source (title or URL), mention it briefly at the end of your answer."""
+If the fragment metadata includes a source (title, path, or URL), mention it briefly at the end of your answer."""
 SYSTEM_PROMPT = _SYSTEM_PROMPT_DEFAULT
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -90,13 +94,17 @@ def apply_app_config(cfg: dict[str, Any]) -> None:
     """
     Merge YAML settings into module-level paths and prompts (no need to fork app.py for new folders).
     """
-    global JSON_DIR, CHROMA_DIR, EMBEDDING_MODEL, SYSTEM_PROMPT, RETRIEVAL_TOP_K
+    global JSON_DIR, CHROMA_DIR, VAULT_DIR, EMBEDDING_MODEL, SYSTEM_PROMPT, RETRIEVAL_TOP_K
 
     paths = cfg.get("paths") or {}
     if isinstance(paths.get("json_dir"), str) and paths["json_dir"].strip():
         JSON_DIR = (BASE_DIR / paths["json_dir"].strip()).resolve()
     if isinstance(paths.get("chroma_db"), str) and paths["chroma_db"].strip():
         CHROMA_DIR = (BASE_DIR / paths["chroma_db"].strip()).resolve()
+    if isinstance(paths.get("vault_dir"), str) and paths["vault_dir"].strip():
+        VAULT_DIR = (BASE_DIR / paths["vault_dir"].strip()).resolve()
+    else:
+        VAULT_DIR = None
 
     models = cfg.get("models") or {}
     if isinstance(models.get("embedding"), str) and models["embedding"].strip():
@@ -325,6 +333,182 @@ def load_json_documents(json_dir: Path) -> list[Document]:
     return docs
 
 
+# --- Obsidian / Markdown vault -------------------------------------------------
+
+DEFAULT_VAULT_EXCLUDE_DIR_NAMES = frozenset({".obsidian", ".git", "node_modules"})
+
+
+def _tags_for_metadata(tags: Any) -> str | None:
+    """Normalize frontmatter tags to a single string for Chroma metadata."""
+    if tags is None:
+        return None
+    if isinstance(tags, str):
+        return tags.strip() or None
+    if isinstance(tags, list):
+        flat = [str(t).strip() for t in tags if str(t).strip()]
+        return ", ".join(flat) if flat else None
+    return str(tags)
+
+
+def _parse_markdown_frontmatter(raw: str) -> tuple[dict[str, Any], str]:
+    """
+    Split optional YAML frontmatter (--- ... ---) from the note body.
+    If PyYAML is available, frontmatter is parsed as YAML; otherwise body is returned with empty meta.
+    """
+    m = re.match(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?(.*)$", raw, re.DOTALL)
+    if not m:
+        return {}, raw
+    fm_text, body = m.group(1), m.group(2)
+    meta: dict[str, Any] = {}
+    if yaml is not None:
+        try:
+            loaded = yaml.safe_load(fm_text)
+            if isinstance(loaded, dict):
+                meta = loaded
+        except Exception:
+            logger.debug("Could not parse YAML frontmatter; indexing body only.")
+    return meta, body
+
+
+def _extract_note_title(body: str, fallback_stem: str) -> str:
+    """First # heading (H1) wins; else use file stem."""
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("# ") and not s.startswith("##"):
+            return s[2:].strip() or fallback_stem
+    return fallback_stem
+
+
+def _split_body_by_h2_h3(body: str) -> list[tuple[str, str]]:
+    """
+    Split markdown body into (section_heading, section_text). heading '' = intro before first ##/###.
+    Section text does not include the '##' line itself.
+    """
+    body = body.strip()
+    if not body:
+        return []
+    segments = re.split(r"\n(?=#{2,3}\s+)", body)
+    out: list[tuple[str, str]] = []
+    for i, seg in enumerate(segments):
+        seg = seg.strip()
+        if not seg:
+            continue
+        if i == 0 and not re.match(r"^#{2,3}\s+", seg):
+            out.append(("", seg))
+            continue
+        first_nl = seg.find("\n")
+        first_line = seg if first_nl == -1 else seg[:first_nl]
+        hm = re.match(r"^#{2,3}\s+(.+)$", first_line.strip())
+        if hm:
+            heading = hm.group(1).strip()
+            rest = seg[first_nl + 1 :].strip() if first_nl != -1 else ""
+            out.append((heading, rest))
+        else:
+            out.append(("", seg))
+    return out
+
+
+def _format_obsidian_chunk(
+    vault_rel: str,
+    note_title: str,
+    section_heading: str,
+    section_text: str,
+    *,
+    tags: str | None,
+) -> tuple[str, dict[str, Any]]:
+    """Build page_content and metadata for one vault chunk (before the trailing [Metadata: ...] line)."""
+    sec_label = section_heading if section_heading else "intro"
+    text = f"Note: {note_title}\nPath: {vault_rel}\nSection: {sec_label}\n\n{section_text.strip()}"
+    source_title = f"{note_title} — {section_heading}" if section_heading else note_title
+    meta: dict[str, Any] = {
+        "format": "obsidian",
+        "title": note_title,
+        "source_title": source_title,
+        "vault_rel_path": vault_rel,
+        "heading": section_heading,
+        "tags": tags,
+    }
+    return text, meta
+
+
+def _md_file_to_documents(path: Path, vault_root: Path) -> list[Document]:
+    """Parse one .md file into one or more Documents (chunked by ##/###)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("Could not read %s: %s", path, e)
+        return []
+    if not raw.strip():
+        return []
+
+    fm, body = _parse_markdown_frontmatter(raw)
+    tags = _tags_for_metadata(fm.get("tags"))
+
+    rel = path.relative_to(vault_root)
+    vault_rel = rel.as_posix()
+    note_title = _extract_note_title(body, path.stem)
+
+    sections = _split_body_by_h2_h3(body)
+    if not sections:
+        return []
+
+    docs: list[Document] = []
+    for idx, (heading, sec_text) in enumerate(sections):
+        if not sec_text.strip():
+            continue
+        page, meta = _format_obsidian_chunk(
+            vault_rel, note_title, heading, sec_text, tags=tags
+        )
+        meta["source_file"] = vault_rel
+        meta["chunk_index"] = idx
+        meta_line_parts = [f"file={vault_rel}", f"title={note_title}"]
+        if tags:
+            meta_line_parts.append(f"tags={tags}")
+        page += "\n[Metadata: " + "; ".join(meta_line_parts) + "]"
+        docs.append(Document(page_content=page, metadata=_clean_metadata(meta)))
+    return docs
+
+
+def load_obsidian_documents(
+    vault_dir: Path,
+    *,
+    exclude_dir_names: frozenset[str] | set[str] | None = None,
+) -> list[Document]:
+    """
+    Recursively index *.md under vault_dir. Skips .obsidian, .git, node_modules in path components.
+    Each file is split on ## / ### headings into multiple chunks.
+    """
+    excl = frozenset(exclude_dir_names) if exclude_dir_names is not None else DEFAULT_VAULT_EXCLUDE_DIR_NAMES
+    if not vault_dir.is_dir():
+        logger.error("Vault directory not found: %s", vault_dir)
+        return []
+
+    out: list[Document] = []
+    for path in sorted(vault_dir.rglob("*.md")):
+        rel_parts = path.relative_to(vault_dir).parts
+        if any(p in excl for p in rel_parts):
+            continue
+        out.extend(_md_file_to_documents(path, vault_dir))
+
+    if not out:
+        logger.warning("No Markdown documents loaded from vault %s", vault_dir)
+    else:
+        logger.info("Loaded %s Obsidian/vault chunk(s) for indexing.", len(out))
+    return out
+
+
+def load_all_documents_for_reindex() -> list[Document]:
+    """Merge JSON knowledge base documents and optional Obsidian vault chunks for --reindex."""
+    docs: list[Document] = []
+    docs.extend(load_json_documents(JSON_DIR))
+    if VAULT_DIR is not None:
+        if VAULT_DIR.is_dir():
+            docs.extend(load_obsidian_documents(VAULT_DIR))
+        else:
+            logger.warning("paths.vault_dir is set but not a directory: %s (skipped).", VAULT_DIR)
+    return docs
+
+
 def build_vectorstore(documents: Iterable[Document], persist_dir: Path, clear: bool) -> Chroma:
     """
     Create or overwrite Chroma with embedded documents.
@@ -341,7 +525,10 @@ def build_vectorstore(documents: Iterable[Document], persist_dir: Path, clear: b
 
     docs_list = list(documents)
     if not docs_list:
-        raise ValueError(f"No documents to index. Check JSON files in {JSON_DIR}.")
+        hint = f"JSON dir: {JSON_DIR}"
+        if VAULT_DIR:
+            hint += f"; vault: {VAULT_DIR}"
+        raise ValueError(f"No documents to index. Check {hint}.")
 
     # from_documents: embeds each Document.page_content and stores vectors + metadata on disk
     vs = Chroma.from_documents(
@@ -548,6 +735,7 @@ def serialize_sources_for_ui(documents: list[Document]) -> list[dict[str, Any]]:
         out.append(
             {
                 "source_file": meta.get("source_file"),
+                "vault_rel_path": meta.get("vault_rel_path"),
                 "label": meta.get("source_title")
                 or meta.get("title")
                 or meta.get("question"),
@@ -611,7 +799,7 @@ def _print_retrieved_sources(out: dict[str, Any]) -> None:
 
 def run_chat(chain, *, show_sources: bool = False) -> None:
     """Simple REPL: send {"input": question} into the retrieval chain and print the answer."""
-    print("Local RAG (JSON). Type exit, quit, or Ctrl+C to leave.")
+    print("Local RAG (documents). Type exit, quit, or Ctrl+C to leave.")
     if show_sources:
         print("(Showing retrieved sources before each answer.)")
     while True:
@@ -646,7 +834,7 @@ def run_single_query(chain, question: str, *, show_sources: bool) -> None:
 def parse_args():
     """CLI: --reindex rebuilds vectors; --model selects which HF instruct checkpoint to load."""
     p = argparse.ArgumentParser(
-        description="RAG over JSON files (paths and prompt can be set in config.yaml)."
+        description="RAG over JSON files and optional Obsidian Markdown vault (see config.yaml)."
     )
     p.add_argument(
         "--config",
@@ -658,7 +846,7 @@ def parse_args():
     p.add_argument(
         "--reindex",
         action="store_true",
-        help="Clear ChromaDB and rebuild the index from JSON",
+        help="Clear ChromaDB and rebuild the index from JSON + optional vault_dir",
     )
     p.add_argument(
         "--model",
@@ -692,7 +880,7 @@ def parse_args():
 def main() -> None:
     """
     Program flow:
-      reindex: load JSON -> embed -> persist Chroma
+      reindex: load JSON + optional vault -> embed -> persist Chroma
       else:    load Chroma from disk
       then:    load quantized LLM -> build retrieval chain -> interactive chat
     """
@@ -708,7 +896,7 @@ def main() -> None:
         RETRIEVAL_TOP_K = max(1, int(args.top_k))
 
     if args.reindex:
-        docs = load_json_documents(JSON_DIR)
+        docs = load_all_documents_for_reindex()
         try:
             vs = build_vectorstore(docs, CHROMA_DIR, clear=True)
         except ValueError as e:

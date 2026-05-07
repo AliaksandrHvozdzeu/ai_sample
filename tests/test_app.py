@@ -6,6 +6,7 @@ LLM / Chroma integration is not run here (no GPU, no large downloads).
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -154,3 +155,69 @@ class TestConfigHelpers:
     def test_resolve_config_explicit(self) -> None:
         p = Path("/tmp/x.yaml")
         assert rag.resolve_config_path(p) == p
+
+    def test_vault_dir_from_config(self) -> None:
+        # paths.vault_dir is resolved relative to app.BASE_DIR (repo root), not cwd.
+        tmp = tempfile.mkdtemp(prefix="pytest_vault_", dir=str(rag.BASE_DIR))
+        rel = Path(tmp).name
+        prev_vault = rag.VAULT_DIR
+        try:
+            rag.apply_app_config({"paths": {"vault_dir": rel}})
+            assert rag.VAULT_DIR == Path(tmp).resolve()
+        finally:
+            rag.VAULT_DIR = prev_vault
+            Path(tmp).rmdir()
+
+
+class TestObsidianHelpers:
+    def test_split_body_intro_and_sections(self) -> None:
+        body = "# Title line ignored here\n\nIntro para.\n\n## First\nA.\n\n### Nested\nB.\n"
+        parts = rag._split_body_by_h2_h3(body)
+        headings = [h for h, _ in parts]
+        assert "" in headings
+        assert "First" in headings
+        assert "Nested" in headings
+
+    def test_tags_for_metadata(self) -> None:
+        assert rag._tags_for_metadata(["a", "b"]) == "a, b"
+        assert rag._tags_for_metadata("x") == "x"
+        assert rag._tags_for_metadata(None) is None
+
+    def test_load_obsidian_skips_dot_obsidian(self, tmp_path: Path) -> None:
+        vault = tmp_path / "v"
+        vault.mkdir()
+        obs = vault / ".obsidian"
+        obs.mkdir()
+        (obs / "secret.md").write_text("## X\nY", encoding="utf-8")
+        (vault / "Note.md").write_text(
+            "---\ntags: [work]\n---\n\n## Section\nBody text.",
+            encoding="utf-8",
+        )
+        docs = rag.load_obsidian_documents(vault)
+        assert len(docs) == 1
+        assert docs[0].metadata.get("format") == "obsidian"
+        assert docs[0].metadata.get("vault_rel_path") == "Note.md"
+        assert "Body text" in docs[0].page_content
+
+    def test_load_all_documents_merges_json_and_vault(self, tmp_path: Path) -> None:
+        jdir = tmp_path / "jin"
+        jdir.mkdir()
+        (jdir / "k.json").write_text(
+            json.dumps([{"title": "J", "content": "C"}]),
+            encoding="utf-8",
+        )
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "N.md").write_text("## Only\nText.", encoding="utf-8")
+
+        prev_json, prev_vault = rag.JSON_DIR, rag.VAULT_DIR
+        try:
+            rag.JSON_DIR = jdir
+            rag.VAULT_DIR = vault
+            merged = rag.load_all_documents_for_reindex()
+            assert len(merged) == 2
+            fmts = {d.metadata.get("format") for d in merged}
+            assert "article" in fmts and "obsidian" in fmts
+        finally:
+            rag.JSON_DIR = prev_json
+            rag.VAULT_DIR = prev_vault

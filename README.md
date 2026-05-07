@@ -1,6 +1,6 @@
-# Local RAG chat (JSON → Chroma → small LLM)
+# Local RAG chat (JSON / optional Obsidian → Chroma → small LLM)
 
-This project runs **on your computer**. It reads text from JSON files, saves a search index, and answers questions using a **small local model**. The answers should follow **your documents**, not random internet facts.
+This project runs **on your computer**. It reads text from JSON files (and optionally Markdown notes from an Obsidian vault folder), saves a search index, and answers questions using a **small local model**. The answers should follow **your documents**, not random internet facts.
 
 ---
 
@@ -21,7 +21,7 @@ This project runs **on your computer**. It reads text from JSON files, saves a s
 | `app.py` | Main program: index + chat. |
 | `requirements.txt` | Python libraries to install. |
 | `package_gan_ai.py` | Optional script to pack a **release bundle** (manifest + files). |
-| `config.yaml` | **Optional.** Change folders, retrieval `top_k`, or system prompt **without editing Python**. |
+| `config.yaml` | **Optional.** Change folders (`json_dir`, optional `vault_dir`, `chroma_db`), retrieval `top_k`, or system prompt **without editing Python**. |
 | `web/server.py` | **FastAPI** app: browser UI + **streaming** answers (SSE). |
 | `Dockerfile` / `docker-compose.yml` | Run the web app in Docker with a **volume for Chroma**. |
 
@@ -49,6 +49,23 @@ The app supports:
 **B) Article style** — each item has `title`, `content`, and optionally `url`.
 
 The root JSON can be a **list** of objects, or an **object** that contains a list (see the code if your file looks different).
+
+---
+
+## Obsidian vault (optional Markdown)
+
+You can index **Obsidian** (or any folder of `.md` files) together with JSON:
+
+1. Copy or symlink your vault under the repo, or point `paths.vault_dir` at a folder **relative to the project root** (same rule as `json_dir`).
+2. Set `vault_dir` in `config.yaml`, for example:
+
+```yaml
+paths:
+  json_dir: json
+  vault_dir: vault
+```
+
+3. Run `python app.py --reindex`. Notes are split by `##` / `###` headings into chunks; YAML frontmatter is used when PyYAML is installed (e.g. `tags`). The `.obsidian` folder is skipped automatically.
 
 ---
 
