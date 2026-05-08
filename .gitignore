@@ -1,3 +1,6 @@
+# Local env vars for HF cache paths (created by scripts/setup_venv.ps1)
+env_local.ps1
+
 # Virtual environment (never commit; recreate with py -m venv .venv)
 .venv/
 venv/
@@ -12,11 +15,11 @@ __pycache__/
 dist/
 build/
 
-# Local RAG / downloads (large; optional: keep json/ tracked, ignore only if you prefer)
+# Local RAG / downloads (large)
 chroma_db/
 
-# Hugging Face / PyTorch cache (optional: set HF_HOME inside .venv to project dir)
-# .cache/
+# Hugging Face / PyTorch cache when HF_HOME points at project (see scripts/setup_venv.ps1)
+.cache/
 
 # Docker local overrides
 docker-compose.override.yml
@@ -24,6 +27,7 @@ docker-compose.override.yml
 # IDE
 .idea/
 .vscode/
+*.iml
 
 # OS
 Thumbs.db

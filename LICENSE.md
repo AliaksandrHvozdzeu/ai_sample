@@ -1,6 +1,6 @@
 # License
 
-**Кратко (RU):** репозиторий создан **в учебных целях**; им можно **свободно пользоваться** на условиях MIT ниже; **автор не несёт ответственности** за последствия использования — всё **на ваш риск**.
+**Summary:** this repository was created **for educational purposes**; you may **use it freely** under the MIT terms below; the **author is not responsible** for consequences of use — everything is **at your own risk**.
 
 ---
 

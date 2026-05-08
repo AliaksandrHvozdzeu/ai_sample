@@ -1,292 +1,190 @@
-# Local RAG chat (JSON / optional Obsidian → Chroma → small LLM)
+# Local RAG chat (Markdown vault → Chroma → small LLM)
 
-This project runs **on your computer**. It reads text from JSON files (and optionally Markdown notes from an Obsidian vault folder), saves a search index, and answers questions using a **small local model**. The answers should follow **your documents**, not random internet facts.
+This project runs **on your machine**. It indexes **Markdown notes** from a vault (`paths.vault_dir` in `config.yaml`), stores vectors in **`chroma_db/`**, and answers using a **small local instruct model** (4-bit). Retrieval + generation are grounded on **your vault**, not the open web.
+
+**Current layout:**
+
+| Piece | Role |
+|-------|------|
+| `app.py` | CLI: `--reindex`, interactive chat, `--query`; loads YAML and builds/runs the stack. |
+| `web/server.py` | FastAPI on port **8000**: serves **`web/static/index.html`** (chat + **3D** wikilink graph), **`POST /api/rag/stream`** (SSE), health + graph JSON APIs. |
+| `web/vault_server.py` | Optional “light” server on port **8001**: **`GET /api/vault/graph`** + same HTML; **no LLM** loaded — **`POST /api/rag/stream`** is **not** registered here (use **8000** for chat). |
+
+Indexing is **Markdown-only** (chunks split at `##` / `###`). There is **no** separate JSON knowledge-base pipeline.
 
 ---
 
 ## What you need first
 
-- **Python** 3.10–3.12 works best (some newer Python versions can cause trouble with PyTorch).
-- **NVIDIA GPU** with enough VRAM is recommended (for example 8 GB). The code uses a light model in 4-bit mode.
-- If PyTorch is installed **without CUDA**, everything runs on **CPU** — it works, but it is **much slower**.
+- **Python 3.12** is strongly recommended ( **`scripts/setup_venv.ps1` uses `py -3.12`** when available ). On **Python 3.14**, official **CUDA wheels for PyTorch are often absent**, so `pip` may install **`torch` CPU-only** — the UI works but the LLM stays on CPU.
+- **NVIDIA GPU** with enough VRAM (e.g. **8 GB**) for the default quantized models.
+- If **`torch.version.cuda`** is **`None`**, inference uses **CPU** (much slower). **`setup_venv.ps1`** reinstalls **`torch`** from the **PyTorch CUDA 12.4** index after `requirements.txt` so the GPU can be used on supported Python versions.
+
+### Optional: verify the GPU
+
+After setup:
+
+```powershell
+.\scripts\check_gpu.ps1
+```
+
+You should see a line like `2.x.x+cu124 True` (CUDA build + `torch.cuda.is_available()`).
+
+### Why the chat can feel slow
+
+1. **GPU vs CPU** — The LLM is intended to run on **CUDA**. Startup logs from `app.py` / the web server say whether CUDA is available.
+2. **Token streaming** — Answers are generated token-by-token; **`llm.max_new_tokens`** in `config.yaml` caps the longest reply (default **512**).
+3. **Sampling** — **`do_sample: true`** (default) is slower than greedy **`do_sample: false`** for factual RAG.
+4. **Context size** — Lower **`retrieval.top_k`** slightly shrinks the retrieved prompt.
+
+**Faster preset** (optional, in `config.yaml`):
+
+```yaml
+llm:
+  max_new_tokens: 256
+  do_sample: false
+```
+
+Restart the web app or CLI after changing **`config.yaml`**.
 
 ---
 
 ## Project folders (short overview)
 
-| Folder / file | What it is |
-|---------------|------------|
-| `json/` | Put your `.json` files here. The app reads **all** `*.json` in this folder. |
-| `chroma_db/` | The vector database is stored here after indexing. You can delete it and rebuild with `--reindex`. |
-| `app.py` | Main program: index + chat. |
-| `requirements.txt` | Python libraries to install. |
-| `package_gan_ai.py` | Optional script to pack a **release bundle** (manifest + files). |
-| `config.yaml` | **Optional.** Change folders (`json_dir`, optional `vault_dir`, `chroma_db`), retrieval `top_k`, or system prompt **without editing Python**. |
-| `web/server.py` | **FastAPI** app: browser UI + **streaming** answers (SSE). |
-| `Dockerfile` / `docker-compose.yml` | Run the web app in Docker with a **volume for Chroma**. |
+| Path | Purpose |
+|------|---------|
+| `vault/` | Your `.md` notes (or set `paths.vault_dir` elsewhere). Chunked by `##` / `###`. |
+| `chroma_db/` | Persisted Chroma index. Rebuilt with **`python app.py --reindex`**. |
+| `app.py` | CLI entry: index + chat. |
+| `config.yaml` | Paths, **`retrieval.top_k`**, optional **`llm`** generation settings, system prompt. |
+| `web/static/index.html` | Single-page UI: **chat (left)** + **3D graph (right)**; uses Three.js + **3d-force-graph**. |
+| `requirements.txt` | Runtime dependencies. |
+| `requirements-dev.txt` | Dev deps (e.g. **pytest**). |
+| `scripts/setup_venv.ps1` | Creates **`.venv`** (prefers Python **3.12**), installs deps, then **`torch`** with **CUDA 12.4** from PyTorch’s index. |
+| `scripts/check_gpu.ps1` | Quick **`torch` + CUDA** check. |
+| `scripts/run_app.ps1` / `run_web.ps1` / `run_vault_graph.ps1` | Convenience wrappers around **`python app.py`** and **uvicorn**. |
+| `package_gan_ai.py` | Optional release bundle. |
+| `Dockerfile` / `docker-compose.yml` | Containerized web app; mounts **`vault/`** and Chroma data. |
 
 ---
 
-## Why this repo is a bit special (for your portfolio)
+## Markdown vault
 
-These ideas are simple, but interviewers like **clear settings** and **honest RAG** (you show what the model actually saw):
+1. Set **`paths.vault_dir`** in **`config.yaml`** (relative to project root), e.g. **`vault`**.
+2. Add **`.md`** files. Optional YAML frontmatter (`tags`, etc.) when **PyYAML** is installed.
+3. Chunking splits at **`##`** and **`###`**. Default skipped dirs: **`.obsidian`**, **`.git`**, **`node_modules`**, **`.trash`** (override with **`vault.exclude_dir_names`**).
+4. Rebuild the index: **`python app.py --reindex`**.
 
-- **`config.yaml`** — paths, how many chunks to retrieve (`top_k`), and the system prompt in one place.
-- **`--show-sources`** — before each answer, the app can print **which files / chunks** were retrieved (transparency).
-- **`--query "..."`** — one question and exit (good for **demos**, scripts, or screen recordings).
-- **`--top-k`** — quick experiment: more chunks = more context (but also more noise).
-- **Web UI** — chat in the browser with **token streaming** (not only the terminal).
-- **Docker Compose** — optional **one-command** setup with a **persistent Chroma volume**.
+**Wikilink graph:** open **`http://127.0.0.1:8000/rag/chat`** — notes are **spheres**, **`[[wikilinks]]`** are **edges**; retrieved chunks **pulse** on the graph during each answer.
 
 ---
 
-## JSON format (two types)
+## Step 1 — Virtual environment (Windows, recommended)
 
-The app supports:
-
-**A) FAQ style** — each item has `question` and `answer`.
-
-**B) Article style** — each item has `title`, `content`, and optionally `url`.
-
-The root JSON can be a **list** of objects, or an **object** that contains a list (see the code if your file looks different).
-
----
-
-## Obsidian vault (optional Markdown)
-
-You can index **Obsidian** (or any folder of `.md` files) together with JSON:
-
-1. Copy or symlink your vault under the repo, or point `paths.vault_dir` at a folder **relative to the project root** (same rule as `json_dir`).
-2. Set `vault_dir` in `config.yaml`, for example:
-
-```yaml
-paths:
-  json_dir: json
-  vault_dir: vault
-```
-
-3. Run `python app.py --reindex`. Notes are split by `##` / `###` headings into chunks; YAML frontmatter is used when PyYAML is installed (e.g. `tags`). The `.obsidian` folder is skipped automatically.
-
----
-
-## Step 1 — Virtual environment (recommended)
-
-Using a virtual environment keeps libraries inside your project folder (cleaner PC).
-
-**Windows (PowerShell):**
+From the repo root:
 
 ```powershell
-cd path\to\your\project
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
+cd D:\path\to\AI_SAMPLE
+.\scripts\setup_venv.ps1
 ```
 
-**Linux / macOS:**
+This:
 
-```bash
-cd path/to/your/project
-python3 -m venv .venv
-source .venv/bin/activate
+- Creates **`.venv`** with **`py -3.12`** when possible.
+- Runs **`pip install -r requirements.txt`**.
+- Uninstalls the CPU **`torch`** from PyPI and installs **`torch`** from **`https://download.pytorch.org/whl/cu124`** (CUDA **12.4** runtime bundled with the wheel; works with current NVIDIA drivers).
+
+Optionally dot-source **`env_local.ps1`** (created once) so Hugging Face caches live under **`./.cache/`**:
+
+```powershell
+. .\env_local.ps1
 ```
+
+**Manual venv (any OS):** `python -m venv .venv`, activate, then `pip install -r requirements.txt`, then install **CUDA `torch`** following [pytorch.org](https://pytorch.org/get-started/locally/) for your platform.
 
 ---
 
-## Step 2 — Install libraries
+## Step 2 — Index and run (CLI)
 
-```bash
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+```powershell
+.\scripts\run_app.ps1 --reindex
+.\scripts\run_app.ps1
 ```
 
-### GPU note (NVIDIA)
-
-If you see that the GPU is **not** used, install **PyTorch with CUDA** from the official site:  
-[https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/)
-
-Pick the options that match your system, then follow their `pip` command (often you uninstall the CPU-only `torch` first).
-
----
-
-## Step 3 — Put data and build the index
-
-1. Copy your JSON files into the **`json`** folder.
-2. Build or rebuild the index:
+Or:
 
 ```bash
 python app.py --reindex
-```
-
-This **clears** the old `chroma_db` folder (if it exists) and creates a new index from your JSON.
-
-If there are no valid documents, the program will stop with an error — check your JSON paths and format.
-
----
-
-## Step 4 — Chat with the assistant
-
-Start the chat **without** `--reindex`:
-
-```bash
 python app.py
 ```
 
-Wait until the model finishes loading. Then you will see a prompt like **`You:`**.
+- **`exit`** / **`quit`** or Ctrl+C leaves the CLI loop.
+- Flags: **`--model`**, **`--query "..."`**, **`--show-sources`**, **`--top-k`**, **`--config`**.
 
-- Type your question in **English** (the system prompt is written for English answers).
-- The assistant line starts with **`Assistant:`**.
-- Type **`exit`** or **`quit`** to leave, or press **Ctrl+C**.
-
-### Different LLM (optional)
-
-Default model is **Qwen2.5 1.5B Instruct**. You can switch to the heavier option:
-
-```bash
-python app.py --model unsloth/Llama-3.2-3B-Instruct
-```
-
-### One question only (demo mode)
-
-```bash
-python app.py --query "What is the office Wi-Fi network name?"
-```
-
-### Show where the answer came from (retrieved chunks)
-
-```bash
-python app.py --show-sources
-python app.py --query "Your question" --show-sources
-```
-
-### Custom config file
-
-```bash
-python app.py --config my_settings.yaml
-```
-
-If you **do not** pass `--config`, the app loads **`config.yaml`** automatically **when that file exists** next to `app.py`.
-
-### More chunks from the index (optional)
-
-```bash
-python app.py --top-k 6
-```
-
-### Important behaviour
-
-The assistant is told to answer **only** from the retrieved document text.  
-If the answer is not there, it should say exactly:
+If nothing in the retrieved context answers the question, the configured system prompt asks the model to reply exactly:
 
 **`I could not find this in the documents.`**
 
 ---
 
-## Web UI (browser + streaming)
+## Web UI (browser + SSE)
 
-After you install libraries and build the index (`python app.py --reindex`), start the server:
+After indexing, from project root:
+
+```powershell
+.\scripts\run_web.ps1
+```
+
+Or:
 
 ```bash
 uvicorn web.server:app --host 127.0.0.1 --port 8000
 ```
 
-Open **http://127.0.0.1:8000** in your browser. Type a question and press **Send**. You should see the answer appear **word by word** (streaming).
+Open **`http://127.0.0.1:8000/rag/chat`** (**`/`** redirects there). **One page:** **chat on the left**, **interactive 3D vault graph on the right** (orbit / zoom). Each answer sends an SSE **`sources`** event first so matching notes **pulse** (amber). **Show sources** only toggles the source list in the chat column.
 
-- Turn on **Show sources** to see which JSON chunks were used (same idea as `--show-sources` in the terminal).
-- Check **http://127.0.0.1:8000/api/health** if something fails (for example missing Chroma index).
+The header toolbar includes **Upload .md** (writes files into the vault folder), **Reindex** (rebuilds Chroma and reloads the vector store — status text shows chunk/file counts and timestamp), and **Vault files** (expandable list of **`*.md`** paths under the vault).
 
-**Environment variables (optional):**
+| Path | Purpose |
+|------|---------|
+| `/rag/chat` | Main UI (**`index.html`**) — Chroma + LLM + graph. |
+| `/vault/graph`, `/graph` | Redirect to **`/rag/chat`**. |
+| `POST /api/rag/stream` | SSE chat (alias: **`/api/chat/stream`**). |
+| `GET /api/rag/health` | JSON status (alias: **`/api/health`**). |
+| `GET /api/vault/graph` | Wikilink graph JSON (no generation). |
+| `GET /api/vault/files` | Sorted list of vault-relative **`*.md`** paths. |
+| `POST /api/vault/upload` | Multipart upload of **`.md`** files (saved under vault root by basename). |
+| `POST /api/vault/reindex` | Rebuild Chroma from vault + reload in-memory store (same as **`python app.py --reindex`**). |
 
-| Variable | Meaning |
-|----------|---------|
-| `RAG_MODEL_ID` | Same choices as CLI (`Qwen/...` or `unsloth/Llama-3.2-3B-Instruct`). |
-| `RAG_CONFIG` | Full path to a YAML config file (if you do not use the default `config.yaml`). |
+### Lightweight server (port 8001)
 
-**Note:** The first request can be slow while the model loads into VRAM.
+```powershell
+.\scripts\run_vault_graph.ps1
+```
+
+→ **`http://127.0.0.1:8001/rag/chat`** serves the **same HTML** and **`GET /api/vault/graph`**, but **no LLM** is loaded — use **`http://127.0.0.1:8000`** for real chat.
 
 ---
 
-## Docker Compose (one command)
+## Docker Compose
 
-You need **Docker** and **Docker Compose** installed.
-
-### Basic idea
-
-- **`docker-compose.yml`** starts the **web UI** on port **8000**.
-- Folder **`json/`** on your PC is mounted into the container (**read-only**).
-- Chroma is stored in a **named volume** called **`chroma_data`** so it **does not disappear** when you restart the container.
-
-### Typical workflow
-
-1. Put JSON files in **`json/`** on your machine (same as before).
-2. On your machine (with GPU if possible), build the index once:
-
-   ```bash
-   python app.py --reindex
-   ```
-
-3. Start Docker:
-
-   ```bash
-   docker compose up --build
-   ```
-
-4. Open **http://localhost:8000**.
-
-If the browser shows an error, open **http://localhost:8000/api/health**.  
-Often the problem is: **the container has an empty Chroma folder**. The named volume starts **empty**. You can fix it in two ways:
-
-- **Bind mount your host folder** (easy when you already ran `--reindex` on the host):
-
-  ```bash
-  cp docker-compose.override.example.yml docker-compose.override.yml
-  ```
-
-  Then edit paths if needed and run `docker compose up --build` again.  
-  (`docker-compose.override.yml` is in `.gitignore` so it stays local.)
-
-- Or **copy** your host `./chroma_db` into the volume (more advanced).
-
-### GPU inside Docker
-
-You need the **NVIDIA Container Toolkit** on Linux/WSL2 (or similar on Windows). Then run Compose with GPU access, for example:
-
-```bash
-docker compose up --build
-```
-
-and enable GPU for the service (exact flags depend on your Docker version).  
-If the container runs on **CPU only**, loading the **4-bit** model may fail or be very slow — the README cannot replace your GPU driver docs.
+- **`docker-compose.yml`** exposes **8000** and mounts **`./vault`** read-only; Chroma can live in a named volume.
+- Build the index on the host (**`python app.py --reindex`**) before first run, or mount **`chroma_db`** (see comments in **`docker-compose.yml`**).
 
 ---
 
-## Packaging a release (`gan-ai` bundle)
-
-This does **not** train a new AI model. It only packs **files + manifest** for sharing or versioning.
-
-Examples:
+## Packaging (`package_gan_ai.py`)
 
 ```bash
-python package_gan_ai.py
+python package_gan_ai.py --family gan-ai --version 0.2.0 --include-app --include-vault --include-packager --zip
 ```
 
-With version name and zip:
-
-```bash
-python package_gan_ai.py --family gan-ai --version 0.2.0 --include-app --include-json --include-packager --zip
-```
-
-Rough meaning of flags:
-
-- **`--include-app`** — copies `app.py` and `requirements.txt`.
-- **`--include-json`** — copies the `json/` folder.
-- **`--include-chroma`** — copies `chroma_db/` (can be **large**).
-- **`--include-packager`** — copies `package_gan_ai.py`.
-- **`--zip`** — creates a zip file under **`dist/`**.
-
-Output folders look like **`dist/gan-ai-<version>/`** plus **`manifest.json`** and **`MODEL_CARD.md`**.
+- **`--include-vault`** — includes **`vault/`**.
+- **`--include-chroma`** — includes **`chroma_db/`** (large).
 
 ---
 
-## Tests (for developers)
+## Tests
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
@@ -295,16 +193,18 @@ pytest
 
 ---
 
-## Troubleshooting (quick)
+## Troubleshooting
 
-| Problem | Idea |
-|--------|------|
-| “Database not found” | Run `python app.py --reindex` once after adding JSON. |
-| Very slow answers | Check CUDA PyTorch; first answer after start is often slower. |
-| BitsAndBytes warnings | Usually harmless; updating libraries later can remove them. |
+| Problem | What to try |
+|---------|-------------|
+| **`Database not found`** | Run **`python app.py --reindex`** after adding notes and setting **`paths.vault_dir`**. |
+| **`No documents to index`** | Ensure **`vault_dir`** exists and `.md` files have content under **`##`/`###`** sections. |
+| **Always CPU / very slow** | Use Python **3.12** + rerun **`setup_venv.ps1`**; run **`check_gpu.ps1`**; install CUDA **`torch`** per [pytorch.org](https://pytorch.org/get-started/locally/). |
+| **Chat 503 on port 8001** | The light server has **no** LLM — use port **8000** (`web.server`) for **`/api/rag/stream`**. |
+| **Graph empty / wrong** | Check **`paths.vault_dir`** and that notes use **`[[wikilinks]]`** to existing `.md` paths. |
 
 ---
 
-## Author line (from source)
+## Author
 
-Author: **Hvozdzeu Aliaksandr**, 2026, Vilnius — see `app.py` header.
+**Hvozdzeu Aliaksandr**, 2026, Vilnius — see **`app.py`** header.

@@ -7,11 +7,11 @@ IMPORTANT — what this is NOT:
 
 What this IS:
   A distributable folder (and optional .zip) with manifest.json, MODEL_CARD.md,
-  and optional copies of json/, chroma_db/, app.py, requirements.txt.
+  and optional copies of vault/, chroma_db/, app.py, requirements.txt.
 
 Usage:
   py package_gan_ai.py
-  py package_gan_ai.py --version 0.1.42 --family gan-ai --zip --include-app --include-json
+  py package_gan_ai.py --version 0.1.42 --family gan-ai --zip --include-app --include-vault
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ DEFAULT_FAMILY = "gan-ai"
 DEFAULT_VERSION = "0.0.1"
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-JSON_DIR = PROJECT_ROOT / "json"
+VAULT_DIR = PROJECT_ROOT / "vault"
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 APP_ENTRY = "app.py"
 REQUIREMENTS = "requirements.txt"
@@ -61,7 +61,7 @@ base_model: {DEFAULT_LLM_ID}
 
 - **Retrieval**: Chroma + `{EMBEDDING_MODEL}`
 - **Generation**: local instruct model `{DEFAULT_LLM_ID}` (4-bit in `app.py`)
-- **Knowledge**: JSON files under `json/` (FAQ / article schema as implemented in `app.py`)
+- **Knowledge**: Markdown notes under `vault/` (as indexed by `app.py`)
 
 Version: `{release_version}` · Family: `{release_family}`
 
@@ -153,9 +153,9 @@ def main() -> int:
     )
     parser.add_argument("--zip", action="store_true", help="Also write <family>-<version>.zip under ./dist/")
     parser.add_argument(
-        "--include-json",
+        "--include-vault",
         action="store_true",
-        help=f"Copy {JSON_DIR.name}/ into the bundle",
+        help=f"Copy {VAULT_DIR.name}/ into the bundle",
     )
     parser.add_argument(
         "--include-chroma",
@@ -182,7 +182,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     opts = {
-        "include_json": args.include_json,
+        "include_vault": args.include_vault,
         "include_chroma": args.include_chroma,
         "include_app": args.include_app,
         "include_packager": args.include_packager,
@@ -212,13 +212,13 @@ def main() -> int:
         if _copy_if_exists(PROJECT_ROOT / PACKAGER_SCRIPT, out_dir / PACKAGER_SCRIPT):
             copied.append(PACKAGER_SCRIPT)
 
-    if args.include_json:
-        dst = out_dir / JSON_DIR.name
-        if JSON_DIR.is_dir():
-            shutil.copytree(JSON_DIR, dst, dirs_exist_ok=True)
-            copied.append(f"{JSON_DIR.name}/")
+    if args.include_vault:
+        dst = out_dir / VAULT_DIR.name
+        if VAULT_DIR.is_dir():
+            shutil.copytree(VAULT_DIR, dst, dirs_exist_ok=True)
+            copied.append(f"{VAULT_DIR.name}/")
         else:
-            print(f"Warning: {JSON_DIR} not found; skipped.", file=sys.stderr)
+            print(f"Warning: {VAULT_DIR} not found; skipped.", file=sys.stderr)
 
     if args.include_chroma:
         dst = out_dir / CHROMA_DIR.name

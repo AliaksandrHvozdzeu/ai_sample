@@ -4,14 +4,20 @@ Author: Hvozdzeu Aliaksandr, 2026, Vilnius.
 Local RAG (Retrieval-Augmented Generation) CLI application.
 
 What this script does (high level):
-  1. Loads structured records from JSON files in ./json/ (FAQ or article format), and optionally
-     Markdown notes from an Obsidian vault path (set paths.vault_dir in config.yaml).
-  2. Embeds each record with sentence-transformers and stores vectors in ChromaDB (./chroma_db/).
-  3. At query time, retrieves the most similar chunks, injects them as "context", and runs a
-     small local LLM (4-bit quantized) to answer in English, grounded on that context only.
+  1. Loads Markdown notes from paths.vault_dir in config.yaml (Obsidian-style vault; chunked by ##/###).
+  2. Embeds each chunk with sentence-transformers and stores vectors in ChromaDB (./chroma_db/).
+  3. At query time, retrieves similar chunks, injects them as context, and runs a small local LLM
+     (4-bit quantized) to answer in English, grounded on that context only.
+
+Code map (major sections, top to bottom):
+  - Paths / defaults -> load_app_config_file / apply_app_config (YAML merges into module globals).
+  - Vault indexing: load_obsidian_documents, chunking, build_vectorstore / load_vectorstore.
+  - Wikilink graph JSON for the web UI: build_vault_link_graph, vault_graph_api_payload.
+  - LLM: build_llm_pipeline (4-bit HF model), streaming iter_answer_tokens_stream for FastAPI.
+  - Retrieval helpers: retrieve_context_documents, build_chat_prompt_text, serialize_sources_for_ui.
 
 Run:
-  python app.py --reindex   # rebuild the vector index from JSON + optional vault
+  python app.py --reindex   # rebuild the vector index from the vault
   python app.py             # chat using the existing index
 """
 
@@ -19,8 +25,8 @@ from __future__ import annotations
 
 import argparse
 import copy
-import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -56,22 +62,28 @@ except ImportError:
 # Paths and model IDs (defaults; can be overridden by config.yaml)
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-JSON_DIR = BASE_DIR / "json"  # input: all *.json files here are indexed
 CHROMA_DIR = BASE_DIR / "chroma_db"  # persisted Chroma vector database on disk
-# Optional Obsidian / Markdown vault (directory of *.md). Set paths.vault_dir in config.yaml.
+# Markdown vault (directory of *.md). Set paths.vault_dir in config.yaml (required for --reindex).
 VAULT_DIR: Path | None = None
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # fast local embeddings for retrieval
 DEFAULT_LLM_ID = "Qwen/Qwen2.5-1.5B-Instruct"  # default instruct model (lighter)
 ALT_LLM_ID = "unsloth/Llama-3.2-3B-Instruct"  # alternative instruct model (heavier)
 
-RETRIEVAL_TOP_K = 4  # chunks to retrieve; overridden by config.yaml or --top-k
+# Default count of text chunks retrieved from Chroma for each question (config retrieval.top_k or CLI --top-k).
+RETRIEVAL_TOP_K = 4
+
+# Text generation limits / sampling (config.yaml llm.*); used by build_llm_pipeline and streaming SSE.
+LLM_MAX_NEW_TOKENS = 512
+LLM_DO_SAMPLE = True
+LLM_TEMPERATURE = 0.2
+LLM_TOP_P = 0.9
 
 # Instructions to the LLM: must stay grounded; exact phrase when context is insufficient.
-_SYSTEM_PROMPT_DEFAULT = """You are a precise corporate assistant. Answer questions STRICTLY using only the provided document context below. \
+_SYSTEM_PROMPT_DEFAULT = """You are a precise assistant. Answer questions STRICTLY using only the provided document context below. \
 Do not invent facts or use outside knowledge. \
 If the answer is not in the context, reply exactly: I could not find this in the documents. \
-If the fragment metadata includes a source (title, path, or URL), mention it briefly at the end of your answer."""
+If the fragment metadata includes a source (title or path), mention it briefly at the end of your answer."""
 SYSTEM_PROMPT = _SYSTEM_PROMPT_DEFAULT
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -94,11 +106,11 @@ def apply_app_config(cfg: dict[str, Any]) -> None:
     """
     Merge YAML settings into module-level paths and prompts (no need to fork app.py for new folders).
     """
-    global JSON_DIR, CHROMA_DIR, VAULT_DIR, EMBEDDING_MODEL, SYSTEM_PROMPT, RETRIEVAL_TOP_K
+    global CHROMA_DIR, VAULT_DIR, EMBEDDING_MODEL, SYSTEM_PROMPT, RETRIEVAL_TOP_K
+    global VAULT_EXCLUDE_DIR_NAMES
+    global LLM_MAX_NEW_TOKENS, LLM_DO_SAMPLE, LLM_TEMPERATURE, LLM_TOP_P
 
     paths = cfg.get("paths") or {}
-    if isinstance(paths.get("json_dir"), str) and paths["json_dir"].strip():
-        JSON_DIR = (BASE_DIR / paths["json_dir"].strip()).resolve()
     if isinstance(paths.get("chroma_db"), str) and paths["chroma_db"].strip():
         CHROMA_DIR = (BASE_DIR / paths["chroma_db"].strip()).resolve()
     if isinstance(paths.get("vault_dir"), str) and paths["vault_dir"].strip():
@@ -114,9 +126,55 @@ def apply_app_config(cfg: dict[str, Any]) -> None:
     if retrieval.get("top_k") is not None:
         RETRIEVAL_TOP_K = max(1, int(retrieval["top_k"]))
 
+    llm_cfg = cfg.get("llm") or {}
+    if isinstance(llm_cfg, dict):
+        if llm_cfg.get("max_new_tokens") is not None:
+            LLM_MAX_NEW_TOKENS = max(16, min(4096, int(llm_cfg["max_new_tokens"])))
+        if "do_sample" in llm_cfg:
+            LLM_DO_SAMPLE = bool(llm_cfg["do_sample"])
+        if llm_cfg.get("temperature") is not None:
+            LLM_TEMPERATURE = float(llm_cfg["temperature"])
+        if llm_cfg.get("top_p") is not None:
+            LLM_TOP_P = float(llm_cfg["top_p"])
+
     prompt = cfg.get("prompt") or {}
     if isinstance(prompt.get("system"), str) and prompt["system"].strip():
         SYSTEM_PROMPT = prompt["system"].strip()
+
+    vault_section = cfg.get("vault") or {}
+    if isinstance(vault_section.get("exclude_dir_names"), list):
+        names = [str(x).strip() for x in vault_section["exclude_dir_names"] if str(x).strip()]
+        if names:
+            VAULT_EXCLUDE_DIR_NAMES = frozenset(names)
+
+
+def _venv_consistency_warning() -> None:
+    """
+    If ./.venv exists but the current interpreter is not inside it, warn once.
+    Keeps installs isolated from the global Python when users forget to activate.
+    """
+    project_venv = BASE_DIR / ".venv"
+    if not project_venv.is_dir():
+        return
+    exe = Path(sys.executable).resolve()
+    try:
+        inside_project_venv = exe.is_relative_to(project_venv.resolve())
+    except AttributeError:
+        inside_project_venv = str(exe).startswith(str(project_venv.resolve()))
+    if inside_project_venv:
+        return
+    if os.environ.get("VIRTUAL_ENV"):
+        logger.warning(
+            "A virtualenv is active (%s), but it is not this project's .venv. "
+            "Prefer: .venv\\Scripts\\python.exe or scripts\\run_app.ps1 (Windows).",
+            os.environ["VIRTUAL_ENV"],
+        )
+        return
+    logger.warning(
+        "This interpreter is not the project's .venv (%s). "
+        "Run scripts\\setup_venv.ps1 then scripts\\run_app.ps1 so packages stay inside .venv.",
+        exe,
+    )
 
 
 def resolve_config_path(cli_path: Path | None) -> Path | None:
@@ -182,160 +240,156 @@ def _clean_metadata(meta: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _format_faq_item(obj: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+# --- Markdown vault (index + graph) -------------------------------------------
+
+DEFAULT_VAULT_EXCLUDE_DIR_NAMES = frozenset(
+    {".obsidian", ".git", "node_modules", ".trash"}
+)
+# Overridden by vault.exclude_dir_names in config.yaml
+VAULT_EXCLUDE_DIR_NAMES: frozenset[str] = DEFAULT_VAULT_EXCLUDE_DIR_NAMES
+
+_WIKILINK_BRACKET_RE = re.compile(r"\[\[([^\]]+)\]\]")
+
+
+def extract_wikilink_targets(raw: str) -> list[str]:
     """
-    Format A (FAQ): one object has "question" and "answer".
-    Returns (text_for_embedding, metadata_dict).
+    Collect Obsidian-style [[wikilink]] targets from raw Markdown (includes embeds ![[...]] body).
+    Strips [[alias|display]], heading anchors Note#Heading, and dedupes in order of appearance.
     """
-    q = (obj.get("question") or "").strip()
-    a = (obj.get("answer") or "").strip()
-    text = f"Question: {q}\nAnswer: {a}"
-    meta: dict[str, Any] = {
-        "format": "faq",
-        "question": q,
-        "source_title": q[:200] if q else None,
-    }
-    return text, meta
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _WIKILINK_BRACKET_RE.finditer(raw):
+        inner = m.group(1).strip()
+        if "|" in inner:
+            inner = inner.split("|", 1)[0].strip()
+        if "#" in inner:
+            inner = inner.split("#", 1)[0].strip()
+        inner = inner.replace("\\", "/")
+        if inner and inner not in seen:
+            seen.add(inner)
+            out.append(inner)
+    return out
 
 
-def _format_article_item(obj: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _stem_index_for_vault(files_rel: list[str]) -> dict[str, list[str]]:
+    """Map lowercase note stem -> vault-relative paths (multiple if duplicate names in folders)."""
+    stem_to_ids: dict[str, list[str]] = {}
+    for rel_id in files_rel:
+        stem = Path(rel_id).stem.lower()
+        stem_to_ids.setdefault(stem, []).append(rel_id)
+    return stem_to_ids
+
+
+def resolve_wikilink_to_note_ids(
+    target: str,
+    vault_dir: Path,
+    allowed_ids: set[str],
+    stem_to_ids: dict[str, list[str]],
+) -> list[str]:
     """
-    Format B (article/page): "title", "content", optional "url".
-    URL is both in the body text (for the model) and in metadata (for filtering/display).
+    Map one wikilink path/name to existing note id(s) (vault-relative posix paths).
+    Order: exact relative path match, then basename stem match (possibly multiple).
     """
-    title = (obj.get("title") or "").strip()
-    content = (obj.get("content") or "").strip()
-    url = obj.get("url")
-    if url is not None:
-        url = str(url).strip() or None
-    text = f"Title: {title}\nContent: {content}"
-    if url:
-        text += f"\nURL: {url}"
-    meta: dict[str, Any] = {
-        "format": "article",
-        "title": title,
-        "url": url,
-        "source_title": title or None,
-    }
-    return text, meta
-
-
-def _normalize_records(raw: Any, path: Path) -> list[dict[str, Any]]:
-    """
-    Accept flexible JSON layouts:
-      - top-level list of objects -> use as-is
-      - top-level dict with one list value -> use that list
-      - top-level dict with several lists -> concatenate all list items (with a warning)
-    Returns only dict rows (other types ignored).
-    """
-    if isinstance(raw, list):
-        return [x for x in raw if isinstance(x, dict)]
-    if isinstance(raw, dict):
-        lists = [v for v in raw.values() if isinstance(v, list)]
-        if len(lists) == 1:
-            return [x for x in lists[0] if isinstance(x, dict)]
-        out: list[dict[str, Any]] = []
-        for v in raw.values():
-            if isinstance(v, list):
-                out.extend(x for x in v if isinstance(x, dict))
-        if out:
-            logger.warning(
-                "File %s: multiple arrays in root object; merged all records.",
-                path.name,
-            )
-            return out
-    logger.warning("File %s: no object array found (skipped).", path.name)
-    return []
-
-
-def _object_to_document(obj: dict[str, Any], path: Path, index: int) -> Document | None:
-    """
-    Turn one JSON object into a LangChain Document:
-      - page_content: string fed to the embedder and shown as retrieval context
-      - metadata: stored in Chroma for filtering; important fields are duplicated into page_content
-        so the LLM always sees file/title/url in the retrieved snippet.
-    """
-    has_qa = "question" in obj and "answer" in obj
-    has_article = "title" in obj and "content" in obj
-
-    # Prefer a single format; if both field sets exist, FAQ wins (same as previous behavior).
-    if has_qa and not has_article:
-        page, meta = _format_faq_item(obj)
-    elif has_article and not has_qa:
-        page, meta = _format_article_item(obj)
-    elif has_qa and has_article:
-        page, meta = _format_faq_item(obj)
-        logger.debug("Object %s[%s]: both FAQ and article fields present; treated as FAQ.", path.name, index)
-    else:
-        logger.warning(
-            "File %s[%s]: unknown format (need question+answer or title+content); skipped.",
-            path.name,
-            index,
-        )
-        return None
-
-    # Skip useless rows (empty strings or degenerate templates).
-    if not page.strip() or page.strip() == "Question:\nAnswer:" or page.endswith("Content:"):
-        logger.warning("File %s[%s]: empty content after merging fields; skipped.", path.name, index)
-        return None
-
-    meta["source_file"] = path.name
-    meta["chunk_index"] = index
-    # Append a short metadata line so retrieval context includes citation hints even if
-    # the chain does not expose raw Document.metadata to the prompt by default.
-    meta_line_parts = [f"file={path.name}"]
-    if meta.get("url"):
-        meta_line_parts.append(f"URL={meta['url']}")
-    if meta.get("source_title"):
-        meta_line_parts.append(f"title={meta['source_title']}")
-    page += "\n[Metadata: " + "; ".join(meta_line_parts) + "]"
-
-    return Document(page_content=page, metadata=_clean_metadata(meta))
-
-
-def load_json_documents(json_dir: Path) -> list[Document]:
-    """
-    Scan json_dir for *.json files, parse each file, normalize to record lists, and build Documents.
-    Malformed files are skipped with a warning; processing continues.
-    """
-    if not json_dir.is_dir():
-        logger.error("Directory not found: %s", json_dir)
+    t = target.strip().replace("\\", "/")
+    if not t:
         return []
+    if t.lower().endswith(".md"):
+        t = t[:-3]
+    key_file = (vault_dir / t).with_suffix(".md")
+    try:
+        if key_file.is_file():
+            rid = key_file.resolve().relative_to(vault_dir.resolve()).as_posix()
+            if rid in allowed_ids:
+                return [rid]
+    except ValueError:
+        pass
+    stem = Path(t).stem.lower()
+    return [rid for rid in stem_to_ids.get(stem, []) if rid in allowed_ids]
 
-    docs: list[Document] = []
-    for path in sorted(json_dir.glob("*.json")):
+
+def build_vault_link_graph(
+    vault_dir: Path,
+    *,
+    exclude_dir_names: frozenset[str] | set[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Nodes = *.md under vault_dir (respecting excludes); edges = [[wikilink]] from source to target note.
+    Used by the web UI graph view (Obsidian-style overview).
+    """
+    excl = exclude_dir_names if exclude_dir_names is not None else VAULT_EXCLUDE_DIR_NAMES
+    out: dict[str, Any] = {"nodes": [], "edges": [], "vault_root": str(vault_dir.resolve())}
+
+    if not vault_dir.is_dir():
+        out["error"] = "vault_not_found"
+        out["detail"] = str(vault_dir)
+        return out
+
+    files_rel: list[str] = []
+    abs_by_rel: dict[str, Path] = {}
+    for path in sorted(vault_dir.rglob("*.md")):
+        rel_parts = path.relative_to(vault_dir).parts
+        if any(p in excl for p in rel_parts):
+            continue
+        rel_id = path.relative_to(vault_dir).as_posix()
+        files_rel.append(rel_id)
+        abs_by_rel[rel_id] = path
+
+    allowed_ids = set(files_rel)
+    stem_to_ids = _stem_index_for_vault(files_rel)
+
+    for rel_id in files_rel:
+        label = Path(rel_id).stem
         try:
-            text = path.read_text(encoding="utf-8")
-            if not text.strip():
-                logger.warning("Empty file: %s", path.name)
-                continue
-            raw = json.loads(text)
-        except json.JSONDecodeError as e:
-            logger.warning("Invalid JSON in %s: %s", path.name, e)
+            raw = abs_by_rel[rel_id].read_text(encoding="utf-8")
+            _, body = _parse_markdown_frontmatter(raw)
+            title = _extract_note_title(body, Path(rel_id).stem)
+            if title:
+                label = title
+        except OSError:
+            pass
+        out["nodes"].append({"id": rel_id, "label": label})
+
+    edge_seen: set[tuple[str, str]] = set()
+    for rel_id in files_rel:
+        try:
+            raw = abs_by_rel[rel_id].read_text(encoding="utf-8")
+        except OSError:
             continue
-        except OSError as e:
-            logger.warning("Could not read %s: %s", path.name, e)
-            continue
+        for tgt in extract_wikilink_targets(raw):
+            for dest_id in resolve_wikilink_to_note_ids(tgt, vault_dir, allowed_ids, stem_to_ids):
+                if dest_id == rel_id:
+                    continue
+                key = (rel_id, dest_id)
+                if key in edge_seen:
+                    continue
+                edge_seen.add(key)
+                out["edges"].append({"from": rel_id, "to": dest_id})
 
-        records = _normalize_records(raw, path)
-        if not records:
-            continue
-
-        for i, obj in enumerate(records):
-            doc = _object_to_document(obj, path, i)
-            if doc:
-                docs.append(doc)
-
-    if not docs:
-        logger.warning("No documents loaded from %s", json_dir)
-    else:
-        logger.info("Loaded %s document(s) for indexing.", len(docs))
-    return docs
+    return out
 
 
-# --- Obsidian / Markdown vault -------------------------------------------------
-
-DEFAULT_VAULT_EXCLUDE_DIR_NAMES = frozenset({".obsidian", ".git", "node_modules"})
+def vault_graph_api_payload() -> dict[str, Any]:
+    """JSON for GET /api/vault/graph (used by the full RAG server and vault-only graph server)."""
+    if VAULT_DIR is None:
+        return {
+            "nodes": [],
+            "edges": [],
+            "vault_configured": False,
+            "message": "paths.vault_dir is not set in config.yaml",
+        }
+    root = VAULT_DIR.resolve()
+    if not VAULT_DIR.is_dir():
+        return {
+            "nodes": [],
+            "edges": [],
+            "vault_configured": True,
+            "vault_root": str(root),
+            "error": "vault_not_found",
+            "detail": str(VAULT_DIR),
+        }
+    data = build_vault_link_graph(VAULT_DIR)
+    data["vault_configured"] = True
+    return data
 
 
 def _tags_for_metadata(tags: Any) -> str | None:
@@ -368,6 +422,18 @@ def _parse_markdown_frontmatter(raw: str) -> tuple[dict[str, Any], str]:
         except Exception:
             logger.debug("Could not parse YAML frontmatter; indexing body only.")
     return meta, body
+
+
+def _normalize_obsidian_markup(text: str) -> str:
+    """
+    Light cleanup for indexing: resolve [[wikilinks]] to readable labels and drop embed-only ![[...]].
+    Does not parse full Markdown — keeps retrieval text closer to what humans read in Obsidian.
+    """
+    s = text
+    s = re.sub(r"!\[\[([^\]]*)\]\]", "", s)
+    s = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", s)
+    s = re.sub(r"\[\[([^\]]+)\]\]", r"\1", s)
+    return "\n".join(line.rstrip() for line in s.splitlines()).strip()
 
 
 def _extract_note_title(body: str, fallback_stem: str) -> str:
@@ -418,7 +484,8 @@ def _format_obsidian_chunk(
 ) -> tuple[str, dict[str, Any]]:
     """Build page_content and metadata for one vault chunk (before the trailing [Metadata: ...] line)."""
     sec_label = section_heading if section_heading else "intro"
-    text = f"Note: {note_title}\nPath: {vault_rel}\nSection: {sec_label}\n\n{section_text.strip()}"
+    body = _normalize_obsidian_markup(section_text)
+    text = f"Note: {note_title}\nPath: {vault_rel}\nSection: {sec_label}\n\n{body}"
     source_title = f"{note_title} — {section_heading}" if section_heading else note_title
     meta: dict[str, Any] = {
         "format": "obsidian",
@@ -475,10 +542,10 @@ def load_obsidian_documents(
     exclude_dir_names: frozenset[str] | set[str] | None = None,
 ) -> list[Document]:
     """
-    Recursively index *.md under vault_dir. Skips .obsidian, .git, node_modules in path components.
-    Each file is split on ## / ### headings into multiple chunks.
+    Recursively index *.md under vault_dir. Skips configured folder names in path components
+    (default: .obsidian, .git, node_modules, .trash). Each file is split on ## / ### headings.
     """
-    excl = frozenset(exclude_dir_names) if exclude_dir_names is not None else DEFAULT_VAULT_EXCLUDE_DIR_NAMES
+    excl = frozenset(exclude_dir_names) if exclude_dir_names is not None else VAULT_EXCLUDE_DIR_NAMES
     if not vault_dir.is_dir():
         logger.error("Vault directory not found: %s", vault_dir)
         return []
@@ -498,15 +565,31 @@ def load_obsidian_documents(
 
 
 def load_all_documents_for_reindex() -> list[Document]:
-    """Merge JSON knowledge base documents and optional Obsidian vault chunks for --reindex."""
-    docs: list[Document] = []
-    docs.extend(load_json_documents(JSON_DIR))
-    if VAULT_DIR is not None:
-        if VAULT_DIR.is_dir():
-            docs.extend(load_obsidian_documents(VAULT_DIR))
-        else:
-            logger.warning("paths.vault_dir is set but not a directory: %s (skipped).", VAULT_DIR)
-    return docs
+    """Load vault Markdown chunks for --reindex."""
+    if VAULT_DIR is None:
+        logger.error("Set paths.vault_dir in config.yaml to your Markdown folder.")
+        return []
+    if not VAULT_DIR.is_dir():
+        logger.error("Vault directory not found: %s", VAULT_DIR)
+        return []
+    return load_obsidian_documents(VAULT_DIR)
+
+
+def list_vault_markdown_relpaths() -> list[str]:
+    """
+    Sorted vault-relative paths (posix) for every *.md under VAULT_DIR.
+    Skips the same directory name rules as indexing (VAULT_EXCLUDE_DIR_NAMES).
+    Used by the web UI file list.
+    """
+    if VAULT_DIR is None or not VAULT_DIR.is_dir():
+        return []
+    out: list[str] = []
+    for path in sorted(VAULT_DIR.rglob("*.md")):
+        rel_parts = path.relative_to(VAULT_DIR).parts
+        if any(p in VAULT_EXCLUDE_DIR_NAMES for p in rel_parts):
+            continue
+        out.append(path.relative_to(VAULT_DIR).as_posix())
+    return out
 
 
 def build_vectorstore(documents: Iterable[Document], persist_dir: Path, clear: bool) -> Chroma:
@@ -517,18 +600,17 @@ def build_vectorstore(documents: Iterable[Document], persist_dir: Path, clear: b
     embeddings = _make_embeddings()
     persist_dir.mkdir(parents=True, exist_ok=True)
 
+    docs_list = list(documents)
+    if not docs_list:
+        raise ValueError(
+            "No documents to index. Set paths.vault_dir in config.yaml, add .md files with content, and run --reindex."
+        )
+
     if clear and persist_dir.exists():
         import shutil
 
         shutil.rmtree(persist_dir)
         logger.info("Vector store directory cleared: %s", persist_dir)
-
-    docs_list = list(documents)
-    if not docs_list:
-        hint = f"JSON dir: {JSON_DIR}"
-        if VAULT_DIR:
-            hint += f"; vault: {VAULT_DIR}"
-        raise ValueError(f"No documents to index. Check {hint}.")
 
     # from_documents: embeds each Document.page_content and stores vectors + metadata on disk
     vs = Chroma.from_documents(
@@ -548,6 +630,26 @@ def load_vectorstore(persist_dir: Path) -> Chroma:
             f"Database not found at {persist_dir}. Run: python app.py --reindex"
         )
     return Chroma(persist_directory=str(persist_dir), embedding_function=embeddings)
+
+
+def release_vectorstore(vectorstore: Chroma | None) -> None:
+    """
+    Close the underlying chromadb client so persist_dir can be deleted on Windows.
+    The web server keeps a long-lived Chroma handle; without this, shutil.rmtree
+    hits PermissionError on chroma.sqlite3 (WinError 32).
+    """
+    if vectorstore is None:
+        return
+    client = getattr(vectorstore, "_client", None)
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as e:
+        logger.warning("release_vectorstore: client.close() failed: %s", e)
 
 
 def build_llm_pipeline(model_id: str):
@@ -590,10 +692,10 @@ def build_llm_pipeline(model_id: str):
     # `generation_config` kwarg (newer transformers raise TypeError if passed twice).
     # Prefer max_new_tokens only; clear max_length to avoid conflicting constraints.
     generation_config = copy.deepcopy(model.generation_config)
-    generation_config.max_new_tokens = 512
-    generation_config.do_sample = True
-    generation_config.temperature = 0.2
-    generation_config.top_p = 0.9
+    generation_config.max_new_tokens = LLM_MAX_NEW_TOKENS
+    generation_config.do_sample = LLM_DO_SAMPLE
+    generation_config.temperature = LLM_TEMPERATURE
+    generation_config.top_p = LLM_TOP_P
     generation_config.pad_token_id = tokenizer.pad_token_id
     generation_config.max_length = None
     model.generation_config = generation_config
@@ -727,15 +829,29 @@ def build_chat_prompt_text(tokenizer: Any, user_question: str, context: str) -> 
     )
 
 
+def _vault_rel_path_from_chunk_text(page_content: str | None) -> str | None:
+    """Recover vault-relative path from indexed Markdown chunk text if metadata is missing."""
+    if not page_content:
+        return None
+    m = re.search(r"(?m)^Path:\s*(.+)$", page_content)
+    if not m:
+        return None
+    return m.group(1).strip().replace("\\", "/")
+
+
 def serialize_sources_for_ui(documents: list[Document]) -> list[dict[str, Any]]:
     """Compact JSON for the web UI / SSE \"sources\" event."""
     out: list[dict[str, Any]] = []
     for d in documents:
         meta = d.metadata or {}
+        graph_id = meta.get("vault_rel_path") or meta.get("source_file")
+        if not graph_id:
+            graph_id = _vault_rel_path_from_chunk_text(d.page_content)
         out.append(
             {
-                "source_file": meta.get("source_file"),
-                "vault_rel_path": meta.get("vault_rel_path"),
+                "graph_id": graph_id,
+                "source_file": meta.get("source_file") or graph_id,
+                "vault_rel_path": meta.get("vault_rel_path") or graph_id,
                 "label": meta.get("source_title")
                 or meta.get("title")
                 or meta.get("question"),
@@ -745,11 +861,29 @@ def serialize_sources_for_ui(documents: list[Document]) -> list[dict[str, Any]]:
     return out
 
 
+def _stream_generation_kw(tokenizer: Any, streamer: Any) -> dict[str, Any]:
+    """Kwargs for model.generate — aligned with module-level LLM_* and faster greedy path."""
+    kw: dict[str, Any] = {
+        "max_new_tokens": LLM_MAX_NEW_TOKENS,
+        "do_sample": LLM_DO_SAMPLE,
+        "pad_token_id": tokenizer.pad_token_id,
+        "streamer": streamer,
+    }
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is not None:
+        kw["eos_token_id"] = eos
+    if LLM_DO_SAMPLE:
+        kw["temperature"] = LLM_TEMPERATURE
+        kw["top_p"] = LLM_TOP_P
+    return kw
+
+
 def iter_answer_tokens_stream(tokenizer: Any, pipe: Any, prompt_text: str) -> Iterator[str]:
     """
     Stream decoded fragments while the quantized model generates (for FastAPI SSE).
     Uses TextIteratorStreamer + background generate on the pipeline's underlying model.
     """
+    import torch
     from threading import Thread
 
     from transformers import TextIteratorStreamer
@@ -760,10 +894,12 @@ def iter_answer_tokens_stream(tokenizer: Any, pipe: Any, prompt_text: str) -> It
     enc = {k: v.to(device) for k, v in enc.items()}
 
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    gen_kw = _stream_generation_kw(tokenizer, streamer)
 
     def _worker() -> None:
         try:
-            model.generate(**enc, streamer=streamer)
+            with torch.inference_mode():
+                model.generate(**enc, **gen_kw)
         except Exception:
             logger.exception("Streaming generation failed")
             raise
@@ -834,7 +970,7 @@ def run_single_query(chain, question: str, *, show_sources: bool) -> None:
 def parse_args():
     """CLI: --reindex rebuilds vectors; --model selects which HF instruct checkpoint to load."""
     p = argparse.ArgumentParser(
-        description="RAG over JSON files and optional Obsidian Markdown vault (see config.yaml)."
+        description="Local RAG over Markdown vault (paths.vault_dir in config.yaml)."
     )
     p.add_argument(
         "--config",
@@ -846,7 +982,7 @@ def parse_args():
     p.add_argument(
         "--reindex",
         action="store_true",
-        help="Clear ChromaDB and rebuild the index from JSON + optional vault_dir",
+        help="Clear ChromaDB and rebuild the index from vault_dir (Markdown)",
     )
     p.add_argument(
         "--model",
@@ -880,17 +1016,23 @@ def parse_args():
 def main() -> None:
     """
     Program flow:
-      reindex: load JSON + optional vault -> embed -> persist Chroma
+      reindex: load vault Markdown -> embed -> persist Chroma
       else:    load Chroma from disk
       then:    load quantized LLM -> build retrieval chain -> interactive chat
     """
     global RETRIEVAL_TOP_K
 
     args = parse_args()
+    _venv_consistency_warning()
     cfg_path = resolve_config_path(args.config)
     apply_app_config(load_app_config_file(cfg_path))
     if cfg_path:
         logger.info("Loaded config: %s", cfg_path)
+    logger.info(
+        "LLM generation: max_new_tokens=%s do_sample=%s",
+        LLM_MAX_NEW_TOKENS,
+        LLM_DO_SAMPLE,
+    )
 
     if args.top_k is not None:
         RETRIEVAL_TOP_K = max(1, int(args.top_k))

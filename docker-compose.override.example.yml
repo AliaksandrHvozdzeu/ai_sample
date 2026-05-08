@@ -7,5 +7,5 @@
 services:
   rag-web:
     volumes:
-      - ./json:/app/json:ro
+      - ./vault:/app/vault:ro
       - ./chroma_db:/app/chroma_db

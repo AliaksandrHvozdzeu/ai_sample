@@ -16,7 +16,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./json:/app/json:ro
+      - ./vault:/app/vault:ro
       - chroma_data:/app/chroma_db
     environment:
       RAG_MODEL_ID: ${RAG_MODEL_ID:-Qwen/Qwen2.5-1.5B-Instruct}

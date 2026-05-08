@@ -1,22 +1,37 @@
-# Local RAG — optional configuration (edit paths / prompt without touching Python).
-# If this file is missing, app.py uses built-in defaults.
+# Local RAG — edit paths and prompt without changing Python.
+# If this file is missing, app.py uses built-in defaults (vault_dir must be set for indexing).
 
 paths:
-  json_dir: json
   chroma_db: chroma_db
-  # Obsidian-style Markdown vault (path relative to project root → ai_sample/vault/)
+  # Markdown vault: all *.md under this folder (relative to project root) are indexed
   vault_dir: vault
 
 models:
   embedding: sentence-transformers/all-MiniLM-L6-v2
 
 retrieval:
-  # How many JSON chunks to retrieve for each question (trade-off: noise vs recall)
   top_k: 4
+
+# Generation speed vs quality (web chat + CLI). Greedy (do_sample: false) is faster than sampling.
+# Install CUDA-enabled PyTorch so the LLM runs on GPU — CPU inference is much slower.
+# llm:
+#   max_new_tokens: 256
+#   do_sample: false
+#   temperature: 0.2
+#   top_p: 0.9
+
+# Optional: skip these folder names when scanning the vault
+# vault:
+#   exclude_dir_names:
+#     - .obsidian
+#     - .git
+#     - node_modules
+#     - .trash
+#     - Attachments
 
 prompt:
   system: |
-    You are a precise corporate assistant. Answer questions STRICTLY using only the provided document context below (JSON articles/FAQ and optional Markdown notes).
+    You are a precise assistant. Answer questions STRICTLY using only the provided document context below (Markdown notes from the vault).
     Do not invent facts or use outside knowledge.
     If the answer is not in the context, reply exactly: I could not find this in the documents.
-    If the fragment metadata includes a source (title, path, or URL), mention it briefly at the end of your answer.
+    If the fragment metadata includes a source (title or path), mention it briefly at the end of your answer.

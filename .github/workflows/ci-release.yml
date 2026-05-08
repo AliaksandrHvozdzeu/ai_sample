@@ -69,7 +69,7 @@ jobs:
             --family gan-ai \
             --version "${VERSION}" \
             --include-app \
-            --include-json \
+            --include-vault \
             --include-packager \
             --zip
 
@@ -86,7 +86,7 @@ jobs:
           tag_name: gan-ai-v${{ steps.bundle.outputs.version }}
           name: gan-ai ${{ steps.bundle.outputs.version }}
           body: |
-            Automated **gan-ai** RAG bundle (`manifest.json`, `MODEL_CARD.md`, app + JSON when present).
+            Automated **gan-ai** RAG bundle (`manifest.json`, `MODEL_CARD.md`, app + vault when present).
 
             Trigger: push to **master** / **main** (for example after merging **develop**).
 
