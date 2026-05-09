@@ -15,6 +15,7 @@ Lightweight graph-only server (no LLM): web.vault_server (default port 8001).
 Environment:
   RAG_MODEL_ID   — Hugging Face model id (default: same as app.DEFAULT_LLM_ID)
   RAG_CONFIG     — optional path to YAML config (default: config.yaml if present)
+  RAG_CHAT_DB    — optional absolute path to SQLite chat DB (overrides config chat.db_path)
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -36,11 +37,43 @@ logger = logging.getLogger(__name__)
 
 # Import project RAG stack (expects working directory = repo root)
 import app as rag
+from web.chat_store import ChatStore
+
+# Persistent chat (SQLite). Initialized in _load_stack() after config is applied.
+chat_store: ChatStore | None = None
 
 
 class ChatBody(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
     show_sources: bool = False
+    session_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Ongoing chat session (UUID). Omit to start a new session.",
+    )
+    # Obsidian-native retrieval filters (optional)
+    filter_note: str | None = Field(
+        default=None,
+        max_length=512,
+        description="Vault-relative path to a single .md — restrict retrieval to that note.",
+    )
+    filter_tag: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Substring match against YAML tags embedded in chunk metadata.",
+    )
+    expand_wikilinks: bool = Field(
+        default=True,
+        description="After vector retrieval, add one-hop [[wikilink]] neighbor chunks.",
+    )
+    suggest_vault_edit: bool = Field(
+        default=False,
+        description="Run a second short generation suggesting JSON path + markdown patch.",
+    )
+
+
+class ChatExportBody(BaseModel):
+    session_id: str = Field(..., min_length=8, max_length=64)
 
 
 class AppState:
@@ -58,9 +91,15 @@ state = AppState()
 
 def _load_stack() -> None:
     """Load YAML config, Chroma index, and quantized HF model into AppState."""
+    global chat_store
     cfg_raw = os.environ.get("RAG_CONFIG")
     cfg_path = Path(cfg_raw) if cfg_raw else rag.resolve_config_path(None)
     rag.apply_app_config(rag.load_app_config_file(cfg_path))
+    chat_db_raw = os.environ.get("RAG_CHAT_DB")
+    if chat_db_raw:
+        rag.CHAT_DB_PATH = Path(chat_db_raw).expanduser().resolve()
+    chat_store = ChatStore(rag.CHAT_DB_PATH)
+    logger.info("Web: chat history database at %s", rag.CHAT_DB_PATH)
     if cfg_path and cfg_path.is_file():
         logger.info("Web: loaded config %s", cfg_path)
     logger.info(
@@ -104,6 +143,81 @@ app.add_middleware(
 
 
 # --- JSON diagnostics for the browser / ops ---
+@app.get("/api/chat/history")
+def chat_history(session_id: str = Query(..., min_length=8, max_length=64)) -> dict[str, Any]:
+    """Return persisted messages for a session (used by the SPA on load)."""
+    if chat_store is None:
+        raise HTTPException(status_code=503, detail="Chat store not initialized")
+    if not chat_store.has_session(session_id):
+        raise HTTPException(status_code=404, detail="Unknown session")
+    return {
+        "session_id": session_id,
+        "messages": chat_store.list_messages_api(session_id),
+    }
+
+
+@app.get("/api/chat/sessions")
+def chat_sessions_list() -> dict[str, Any]:
+    """Recent chat sessions (newest first) for ops / optional UI."""
+    if chat_store is None:
+        raise HTTPException(status_code=503, detail="Chat store not initialized")
+    return {"sessions": chat_store.list_sessions(limit=50)}
+
+
+@app.delete("/api/chat/sessions/{session_id}")
+def chat_session_delete(session_id: str) -> dict[str, Any]:
+    """Delete a session and all messages."""
+    if chat_store is None:
+        raise HTTPException(status_code=503, detail="Chat store not initialized")
+    if not chat_store.delete_session(session_id):
+        raise HTTPException(status_code=404, detail="Unknown session")
+    return {"ok": True, "deleted": session_id}
+
+
+@app.post("/api/chat/export")
+def chat_export_markdown(body: ChatExportBody) -> dict[str, Any]:
+    """Write the session transcript to vault_dir/Chat exports/<date>-chat-<id>.md"""
+    if rag.VAULT_DIR is None:
+        raise HTTPException(status_code=400, detail="paths.vault_dir is not set in config.yaml")
+    if not rag.VAULT_DIR.is_dir():
+        raise HTTPException(status_code=400, detail=f"Vault not found: {rag.VAULT_DIR}")
+    if chat_store is None:
+        raise HTTPException(status_code=503, detail="Chat store not initialized")
+    if not chat_store.has_session(body.session_id):
+        raise HTTPException(status_code=404, detail="Unknown session")
+
+    rows = chat_store.list_messages_api(body.session_id, limit=2000)
+    lines = [
+        "# Chat export",
+        "",
+        f"- Session: `{body.session_id}`",
+        f"- Exported (UTC): {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}",
+        "",
+    ]
+    for m in rows:
+        role = m.get("role", "?")
+        lines.append(f"## {role}")
+        lines.append("")
+        lines.append(str(m.get("content", "")))
+        lines.append("")
+
+    out_dir = rag.VAULT_DIR / "Chat exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fname = datetime.now(timezone.utc).strftime("%Y-%m-%d") + f"-chat-{body.session_id[:8]}.md"
+    target = out_dir / fname
+    # Avoid accidental overwrite: bump suffix if exists
+    if target.is_file():
+        for i in range(2, 50):
+            alt = out_dir / (fname[:-3] + f"-{i}.md")
+            if not alt.is_file():
+                target = alt
+                break
+
+    target.write_text("\n".join(lines), encoding="utf-8")
+    rel = target.relative_to(rag.VAULT_DIR.resolve()).as_posix()
+    return {"ok": True, "vault_rel_path": rel, "bytes": target.stat().st_size}
+
+
 @app.get("/api/rag/health")
 @app.get("/api/health")
 def rag_health() -> dict[str, Any]:
@@ -247,23 +361,86 @@ def _sse_chat(body: ChatBody):
         raise HTTPException(status_code=503, detail=state.startup_error)
     if state.vectorstore is None or state.tokenizer is None or state.pipe is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
+    if chat_store is None:
+        raise HTTPException(status_code=503, detail="Chat store not initialized")
 
     question = body.message.strip()
-    docs = rag.retrieve_context_documents(state.vectorstore, question)
-    ctx = rag.documents_context_string(docs)
-    prompt_text = rag.build_chat_prompt_text(state.tokenizer, question, ctx)
+    sid = chat_store.ensure_session(body.session_id)
+    prior_linear = chat_store.list_linear_messages(sid)
+
+    retrieval_q = rag.build_retrieval_query_from_history(
+        question,
+        prior_linear,
+        retrieval_pairs=rag.CHAT_RETRIEVAL_HISTORY_PAIRS,
+    )
+
+    chroma_where: dict[str, Any] | None = None
+    fn = (body.filter_note or "").strip().replace("\\", "/")
+    if fn:
+        chroma_where = {"vault_rel_path": fn}
+
+    scored = rag.retrieve_context_documents_scored(
+        state.vectorstore,
+        retrieval_q,
+        top_k=rag.RETRIEVAL_TOP_K,
+        chroma_where=chroma_where,
+        tag_filter=body.filter_tag,
+    )
+    primary_docs = [d for d, _ in scored]
+
+    neighbor_docs: list[Any] = []
+    if (
+        body.expand_wikilinks
+        and rag.VAULT_DIR is not None
+        and rag.VAULT_DIR.is_dir()
+        and rag.GRAPH_EXPAND_MAX_NOTES > 0
+        and rag.GRAPH_EXPAND_MAX_CHUNKS > 0
+    ):
+        neighbor_docs = rag.expand_docs_via_wikilink_neighbors(
+            rag.VAULT_DIR,
+            primary_docs,
+            max_neighbor_notes=rag.GRAPH_EXPAND_MAX_NOTES,
+            max_neighbor_chunks=rag.GRAPH_EXPAND_MAX_CHUNKS,
+            exclude_dir_names=rag.VAULT_EXCLUDE_DIR_NAMES,
+        )
+
+    ctx = rag.documents_context_with_neighbor_section(primary_docs, neighbor_docs)
+
+    scored_for_ui: list[tuple[Any, float | None]] = [(d, s) for d, s in scored]
+    for nd in neighbor_docs:
+        scored_for_ui.append((nd, None))
+
+    prior_pairs = rag.linear_roles_to_pairs(prior_linear)
+    hist_pairs = rag.take_last_pairs(prior_pairs, rag.CHAT_HISTORY_MAX_PAIRS)
+    history_block = rag.format_pairs_for_prompt(hist_pairs, rag.CHAT_MAX_HISTORY_CHARS)
+
+    prompt_text = rag.build_chat_prompt_text_with_vault_context(
+        state.tokenizer,
+        question,
+        ctx,
+        history_block,
+    )
 
     def events():
+        yield f"data: {json.dumps({'type': 'meta', 'session_id': sid}, ensure_ascii=False)}\n\n"
         # Always send retrieved sources first so the chat+graph UI can highlight vault nodes;
         # the client only shows the text list when the user enabled "Show sources".
         payload = json.dumps(
-            {"type": "sources", "items": rag.serialize_sources_for_ui(docs)},
+            {
+                "type": "sources",
+                "items": rag.serialize_sources_for_ui(
+                    scored_for_ui,
+                    vault_root=rag.VAULT_DIR,
+                ),
+            },
             ensure_ascii=False,
         )
         yield f"data: {payload}\n\n"
+        pieces: list[str] = []
         try:
             for fragment in rag.iter_answer_tokens_stream(state.tokenizer, state.pipe, prompt_text):
                 if fragment:
+                    pieces.append(fragment)
                     piece = json.dumps(
                         {"type": "token", "text": fragment},
                         ensure_ascii=False,
@@ -273,6 +450,26 @@ def _sse_chat(body: ChatBody):
             err = json.dumps({"type": "error", "detail": str(e)}, ensure_ascii=False)
             yield f"data: {err}\n\n"
             return
+        answer_text = "".join(pieces).strip()
+        if answer_text and body.suggest_vault_edit:
+            try:
+                edit = rag.generate_vault_edit_suggestion(
+                    state.tokenizer,
+                    state.pipe,
+                    question=question,
+                    vault_excerpts=ctx,
+                    assistant_answer=answer_text,
+                )
+                if edit and (edit.get("markdown") or edit.get("path")):
+                    yield f"data: {json.dumps({'type': 'vault_edit', **edit}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                logger.exception("Vault edit suggestion failed: %s", e)
+        if answer_text:
+            try:
+                chat_store.append_message(sid, "user", question)
+                chat_store.append_message(sid, "assistant", answer_text)
+            except Exception as e:
+                logger.exception("Failed to persist chat messages: %s", e)
         done = json.dumps({"type": "done"}, ensure_ascii=False)
         yield f"data: {done}\n\n"
 

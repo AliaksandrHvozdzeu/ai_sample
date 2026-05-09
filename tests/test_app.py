@@ -22,8 +22,58 @@ class TestCleanMetadata:
 
 class TestSystemPrompt:
     def test_has_grounding_rules(self) -> None:
-        assert "document context" in rag.SYSTEM_PROMPT.lower()
-        assert "could not find this in the documents" in rag.SYSTEM_PROMPT.lower()
+        low = rag.SYSTEM_PROMPT.lower()
+        assert "vault" in low or "excerpt" in low
+        assert "could not find this in the documents" in low
+
+
+class TestWikilinkExpand:
+    def test_neighbor_chunks_from_graph(self, tmp_path: Path) -> None:
+        from langchain_core.documents import Document
+
+        v = tmp_path / "vault"
+        v.mkdir()
+        (v / "Alpha.md").write_text("## One\nSee [[Bravo]] for more.\n", encoding="utf-8")
+        (v / "Bravo.md").write_text("## Two\nBody B.\n", encoding="utf-8")
+        seed = [Document(page_content="x", metadata={"vault_rel_path": "Alpha.md"})]
+        out = rag.expand_docs_via_wikilink_neighbors(
+            v,
+            seed,
+            max_neighbor_notes=3,
+            max_neighbor_chunks=6,
+            exclude_dir_names=frozenset(),
+        )
+        paths = {(d.metadata or {}).get("vault_rel_path") for d in out}
+        assert "Bravo.md" in paths
+
+
+class TestChatHistoryHelpers:
+    def test_linear_roles_to_pairs(self) -> None:
+        linear = [
+            ("user", "Hi"),
+            ("assistant", "Hello"),
+            ("user", "VPN?"),
+        ]
+        assert rag.linear_roles_to_pairs(linear) == [("Hi", "Hello")]
+
+    def test_build_retrieval_query_from_history(self) -> None:
+        prior = [
+            ("user", "What is VPN?"),
+            ("assistant", "Corporate VPN is described in the IT note."),
+        ]
+        q = rag.build_retrieval_query_from_history(
+            "Tell me more about that.",
+            prior,
+            retrieval_pairs=2,
+        )
+        assert "Follow-up question:" in q
+        assert "Tell me more" in q
+        assert "VPN" in q
+
+    def test_format_pairs_for_prompt_truncates(self) -> None:
+        pairs = [("u" * 5000, "a" * 5000)]
+        out = rag.format_pairs_for_prompt(pairs, max_chars=100)
+        assert len(out) == 100
 
 
 class TestParseArgs:

@@ -168,6 +168,43 @@
     .typing { color: var(--muted); font-size: 0.78rem; margin-top: 0.2rem; }
     .err { color: #f87171; font-size: 0.85rem; }
 
+    .rag-tools {
+      flex-shrink: 0;
+      padding: 0.5rem 1rem 0;
+      border-top: 1px solid var(--split-border);
+      font-size: 0.78rem;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem 0.75rem;
+    }
+    .rag-tools label { display: inline-flex; align-items: center; gap: 0.25rem; margin: 0; }
+    .rag-tools select, .rag-tools input[type="text"] {
+      background: #0f1419;
+      border: 1px solid #334155;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 0.25rem 0.4rem;
+      font-size: 0.78rem;
+      max-width: 14rem;
+    }
+    .vault-edit-panel {
+      margin-top: 0.5rem;
+      padding: 0.5rem 0.65rem;
+      background: #121a24;
+      border: 1px dashed #334155;
+      border-radius: 8px;
+      font-size: 0.78rem;
+    }
+    .vault-edit-panel pre {
+      margin: 0.35rem 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 12rem;
+      overflow: auto;
+    }
+
     #graph-hint {
       flex-shrink: 0;
       padding: 0.35rem 0.75rem;
@@ -212,6 +249,7 @@
       </div>
       <div class="app-header-tools">
         <input type="file" id="vault-file-input" class="sr-only" accept=".md,.markdown,text/markdown" multiple />
+        <button type="button" class="btn-tool" id="btn-new-chat" title="Start a fresh conversation (new session)">New chat</button>
         <button type="button" class="btn-tool" id="btn-upload-md" title="Upload .md files into the vault folder">Upload .md</button>
         <button type="button" class="btn-tool btn-tool-primary" id="btn-reindex" title="Rebuild the vector index from all vault Markdown">Reindex</button>
         <span class="tool-status" id="reindex-status" role="status" aria-live="polite"></span>
@@ -230,6 +268,13 @@
   <div id="split">
     <section id="chat-panel">
       <div id="chat"></div>
+      <div id="rag-tools" class="rag-tools">
+        <label>Note filter <select id="filter-note" title="Restrict search to one .md file"><option value="">(all notes)</option></select></label>
+        <label>Tag <input type="text" id="filter-tag" placeholder="substring" maxlength="128" title="Match YAML tags field" /></label>
+        <label><input type="checkbox" id="expand-wikilinks" checked /> Wikilink +1 hop</label>
+        <label><input type="checkbox" id="suggest-edit" /> Suggest vault edit</label>
+        <button type="button" class="btn-tool" id="btn-export-chat" title="Save transcript to vault/Chat exports/">Export chat</button>
+      </div>
       <div id="bar">
         <input id="inp" type="text" placeholder="Ask something..." autocomplete="off" />
         <label><input type="checkbox" id="sources" /> Show sources</label>
@@ -249,6 +294,8 @@
   const NODE = '#aeb8ff';
   const LINK = '#5c6074';
   const PULSE = '#ffc107';
+  /** Active note-filter selection (matches vault_rel_path / graph node id). */
+  const FILTER_NODE = '#ef4444';
 
   const chat = document.getElementById('chat');
   const inp = document.getElementById('inp');
@@ -260,6 +307,13 @@
   const btnUploadMd = document.getElementById('btn-upload-md');
   const btnReindex = document.getElementById('btn-reindex');
   const reindexStatus = document.getElementById('reindex-status');
+  const filterNote = document.getElementById('filter-note');
+  const filterTag = document.getElementById('filter-tag');
+  const expandWikilinks = document.getElementById('expand-wikilinks');
+  const suggestEdit = document.getElementById('suggest-edit');
+  const btnExportChat = document.getElementById('btn-export-chat');
+
+  const btnNewChat = document.getElementById('btn-new-chat');
   const btnVaultToggle = document.getElementById('btn-vault-toggle');
   const vaultFilesPanel = document.getElementById('vault-files-panel');
   const vaultFilesList = document.getElementById('vault-files-list');
@@ -275,6 +329,94 @@
   let graphResizeObserver = null;
   let graphListenersAttached = false;
   var graphResizeRafGlobal = null;
+  /** Resolved graph node id for the Note filter (red sphere); null = all notes. */
+  var filterGraphNodeId = null;
+
+  /** Persisted server session (SQLite); next requests send this id for dialog + RAG context. */
+  var SESSION_KEY = 'rag_chat_session_id';
+
+  async function loadPersistedChat() {
+    var sid = localStorage.getItem(SESSION_KEY);
+    if (!sid) return;
+    try {
+      var r = await fetch('/api/chat/history?session_id=' + encodeURIComponent(sid));
+      if (r.status === 404) {
+        localStorage.removeItem(SESSION_KEY);
+        return;
+      }
+      if (!r.ok) return;
+      var j = await r.json();
+      chat.innerHTML = '';
+      (j.messages || []).forEach(function (m) {
+        addBubble(m.role === 'user' ? 'user' : 'bot', m.content);
+      });
+      chat.scrollTop = chat.scrollHeight;
+    } catch (err) {}
+  }
+
+  function startNewChat() {
+    localStorage.removeItem(SESSION_KEY);
+    chat.innerHTML = '';
+    inp.focus();
+  }
+
+  function syncNoteFilterGraphHighlight() {
+    var v = (filterNote && filterNote.value) ? filterNote.value.trim() : '';
+    filterGraphNodeId = v ? resolveGraphNodeId(v) : null;
+    applyNodeColors();
+  }
+
+  async function populateNoteFilter() {
+    try {
+      var r = await fetch('/api/vault/files');
+      var j = await r.json();
+      if (!j.files || !j.files.length) return;
+      var sel = filterNote;
+      var cur = sel.value;
+      sel.innerHTML = '<option value="">(all notes)</option>';
+      j.files.forEach(function (p) {
+        var o = document.createElement('option');
+        o.value = p;
+        o.textContent = p.length > 48 ? p.slice(0, 46) + '…' : p;
+        sel.appendChild(o);
+      });
+      if (cur && Array.prototype.some.call(sel.options, function (x) { return x.value === cur; })) {
+        sel.value = cur;
+      }
+      syncNoteFilterGraphHighlight();
+    } catch (e) {}
+  }
+
+  if (filterNote) {
+    filterNote.addEventListener('change', syncNoteFilterGraphHighlight);
+  }
+
+  btnExportChat.onclick = async function () {
+    var sid = localStorage.getItem(SESSION_KEY);
+    if (!sid) {
+      alert('No active session yet — send a message first.');
+      return;
+    }
+    btnExportChat.disabled = true;
+    try {
+      var r = await fetch('/api/chat/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid }),
+      });
+      var j = await r.json().catch(function () { return {}; });
+      if (!r.ok) {
+        alert(j.detail || r.statusText || 'Export failed');
+        return;
+      }
+      alert('Saved to vault: ' + (j.vault_rel_path || '(ok)'));
+      populateNoteFilter();
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      btnExportChat.disabled = false;
+    }
+  };
 
   function fitGraphToContainer() {
     if (!graph3d || !graphRoot) return;
@@ -341,6 +483,9 @@
   function applyNodeColors() {
     if (!graph3d) return;
     graph3d.nodeColor(function (n) {
+      if (filterGraphNodeId && n.id === filterGraphNodeId) {
+        return FILTER_NODE;
+      }
       if (pulsingIds.has(n.id)) return pulsePhase ? PULSE : NODE;
       return NODE;
     });
@@ -385,7 +530,7 @@
     graphHint.textContent =
       n === 0
         ? 'No notes in vault.'
-        : n + ' notes, ' + e + ' links (3D). Drag to orbit, scroll to zoom.';
+        : n + ' notes, ' + e + ' links (3D). Drag to orbit, scroll to zoom. Click a sphere to set the note filter (red).';
 
     if (typeof ForceGraph3D !== 'function') {
       graphHint.className = 'err';
@@ -416,11 +561,24 @@
       .enableNodeDrag(true)
       .showNavInfo(true)
       .cooldownTicks(120)
+      .onNodeClick(function (node) {
+        if (!node || node.id === undefined || node.id === null) return;
+        if (filterNote) {
+          filterNote.value = String(node.id);
+          syncNoteFilterGraphHighlight();
+        }
+        graphHint.className = '';
+        graphHint.textContent =
+          'Note filter: ' +
+          String(node.id) +
+          ' (red). Ask in chat — retrieval uses this file only. Choose “(all notes)” to clear.';
+      })
       .onEngineStop(function () {
         if (graph3d) graph3d.zoomToFit(400, 80);
       });
 
     applyNodeColors();
+    syncNoteFilterGraphHighlight();
 
     scheduleGraphResize();
     requestAnimationFrame(function () {
@@ -586,11 +744,14 @@
     botWrap.className = 'msg bot';
     const answerDiv = document.createElement('div');
     answerDiv.className = 'answer-body';
+    const vaultEditHost = document.createElement('div');
+    vaultEditHost.className = 'vault-edit-host';
     const typing = document.createElement('div');
     typing.className = 'typing';
     typing.textContent = 'Thinking...';
     botWrap.appendChild(typing);
     botWrap.appendChild(answerDiv);
+    botWrap.appendChild(vaultEditHost);
     chat.appendChild(botWrap);
     let botText = '';
 
@@ -598,7 +759,15 @@
       const res = await fetch('/api/rag/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: q, show_sources: showSources.checked }),
+        body: JSON.stringify({
+          message: q,
+          show_sources: showSources.checked,
+          session_id: localStorage.getItem(SESSION_KEY),
+          filter_note: (filterNote && filterNote.value) ? filterNote.value : null,
+          filter_tag: (filterTag && filterTag.value.trim()) ? filterTag.value.trim() : null,
+          expand_wikilinks: expandWikilinks ? expandWikilinks.checked : true,
+          suggest_vault_edit: suggestEdit ? suggestEdit.checked : false,
+        }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -630,17 +799,55 @@
           } catch (e) {
             continue;
           }
+          if (data.type === 'meta' && data.session_id) {
+            try {
+              localStorage.setItem(SESSION_KEY, data.session_id);
+            } catch (e1) {}
+          }
           if (data.type === 'sources' && data.items) {
             if (showSources.checked) {
-              const lines = data.items.map(
-                (it) => '* ' + (it.source_file || '?') + ' - ' + (it.label || '').slice(0, 80)
-              );
+              const lines = data.items.map(function (it) {
+                var bits = ['* ' + (it.source_file || '?')];
+                if (it.distance !== undefined && it.distance !== null) {
+                  bits.push('dist:' + Number(it.distance).toFixed(4));
+                }
+                if (it.context_expand) bits.push('[' + it.context_expand + ']');
+                bits.push('- ' + (it.label || '').slice(0, 72));
+                var line = bits.join(' ');
+                if (it.obsidian_uri) {
+                  line += '\n  ' + it.obsidian_uri;
+                }
+                if (it.match_hint && it.distance !== undefined) {
+                  line += '\n  (' + it.match_hint + ')';
+                }
+                return line;
+              });
               const div = document.createElement('div');
               div.className = 'sources';
               div.textContent = 'Sources:\n' + lines.join('\n');
               botWrap.insertBefore(div, typing);
             }
             schedulePulseFromSources(data.items);
+          }
+          if (data.type === 'vault_edit') {
+            vaultEditHost.innerHTML = '';
+            var panel = document.createElement('div');
+            panel.className = 'vault-edit-panel';
+            var pathEl = document.createElement('div');
+            pathEl.innerHTML = '<strong>Suggested patch</strong> → <code>' + escapeHtml(data.path || '') + '</code>';
+            var pre = document.createElement('pre');
+            pre.textContent = data.markdown || '';
+            var btnCopy = document.createElement('button');
+            btnCopy.type = 'button';
+            btnCopy.textContent = 'Copy markdown';
+            btnCopy.style.marginTop = '0.35rem';
+            btnCopy.onclick = function () {
+              navigator.clipboard.writeText(data.markdown || '').catch(function () {});
+            };
+            panel.appendChild(pathEl);
+            panel.appendChild(pre);
+            panel.appendChild(btnCopy);
+            vaultEditHost.appendChild(panel);
           }
           if (data.type === 'token' && data.text) {
             botText += data.text;
@@ -706,6 +913,10 @@
       vaultFilesMeta.textContent = String(err);
     }
   }
+
+  btnNewChat.onclick = function () {
+    startNewChat();
+  };
 
   btnVaultToggle.onclick = function () {
     var collapsed = vaultFilesPanel.classList.toggle('is-collapsed');
@@ -785,6 +996,9 @@
       btnReindex.disabled = false;
     }
   };
+
+  loadPersistedChat();
+  populateNoteFilter();
 
   fetch('/api/rag/health')
     .then(function (r) {

@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import logging
 import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+from urllib.parse import quote
 
 # LangChain: classic package holds retrieval chains; fallback supports older langchain installs.
 from langchain_core.messages import BaseMessage
@@ -80,11 +82,31 @@ LLM_TEMPERATURE = 0.2
 LLM_TOP_P = 0.9
 
 # Instructions to the LLM: must stay grounded; exact phrase when context is insufficient.
-_SYSTEM_PROMPT_DEFAULT = """You are a precise assistant. Answer questions STRICTLY using only the provided document context below. \
+# Web chat may include a "Recent conversation" block for pronouns/follow-ups only; factual answers must still
+# come from the "Relevant excerpts from your Obsidian vault" section.
+_SYSTEM_PROMPT_DEFAULT = """You are a precise assistant for an Obsidian vault. Answer questions STRICTLY using only \
+the "Relevant excerpts from your Obsidian vault" section in the user message. \
+A "Recent conversation" section may appear for follow-up phrasing only — it is NOT a verified source of facts. \
 Do not invent facts or use outside knowledge. \
-If the answer is not in the context, reply exactly: I could not find this in the documents. \
-If the fragment metadata includes a source (title or path), mention it briefly at the end of your answer."""
+If the answer is not in the vault excerpts, reply exactly: I could not find this in the documents. \
+If an excerpt includes a note title or path, mention it briefly at the end of your answer."""
 SYSTEM_PROMPT = _SYSTEM_PROMPT_DEFAULT
+
+# Web UI chat persistence / dialog context (overridden by config.yaml chat.*)
+CHAT_HISTORY_MAX_PAIRS = 6  # max (user, assistant) pairs injected into the prompt
+CHAT_RETRIEVAL_HISTORY_PAIRS = 2  # recent pairs used to augment the embedding search query
+CHAT_MAX_HISTORY_CHARS = 8000  # trim "Recent conversation" block from the start if longer
+CHAT_DB_PATH = BASE_DIR / ".rag_chat.sqlite"  # SQLite path for FastAPI (relative paths resolved vs BASE_DIR)
+
+# Wikilink neighborhood expansion (after primary retrieval) — retrieval.graph_expand_* in config.yaml
+GRAPH_EXPAND_MAX_NOTES = 3
+GRAPH_EXPAND_MAX_CHUNKS = 8
+
+# Obsidian deep links (obsidian://) — obsidian.vault_name in config.yaml; optional
+OBSIDIAN_VAULT_NAME: str | None = None
+
+# Second-pass JSON suggestion for vault edits (web UI checkbox)
+VAULT_EDIT_MAX_TOKENS = 192
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -109,6 +131,8 @@ def apply_app_config(cfg: dict[str, Any]) -> None:
     global CHROMA_DIR, VAULT_DIR, EMBEDDING_MODEL, SYSTEM_PROMPT, RETRIEVAL_TOP_K
     global VAULT_EXCLUDE_DIR_NAMES
     global LLM_MAX_NEW_TOKENS, LLM_DO_SAMPLE, LLM_TEMPERATURE, LLM_TOP_P
+    global CHAT_HISTORY_MAX_PAIRS, CHAT_RETRIEVAL_HISTORY_PAIRS, CHAT_MAX_HISTORY_CHARS, CHAT_DB_PATH
+    global GRAPH_EXPAND_MAX_NOTES, GRAPH_EXPAND_MAX_CHUNKS, OBSIDIAN_VAULT_NAME, VAULT_EDIT_MAX_TOKENS
 
     paths = cfg.get("paths") or {}
     if isinstance(paths.get("chroma_db"), str) and paths["chroma_db"].strip():
@@ -125,6 +149,18 @@ def apply_app_config(cfg: dict[str, Any]) -> None:
     retrieval = cfg.get("retrieval") or {}
     if retrieval.get("top_k") is not None:
         RETRIEVAL_TOP_K = max(1, int(retrieval["top_k"]))
+    if retrieval.get("graph_expand_max_notes") is not None:
+        GRAPH_EXPAND_MAX_NOTES = max(0, min(16, int(retrieval["graph_expand_max_notes"])))
+    if retrieval.get("graph_expand_max_chunks") is not None:
+        GRAPH_EXPAND_MAX_CHUNKS = max(0, min(48, int(retrieval["graph_expand_max_chunks"])))
+
+    obsidian_cfg = cfg.get("obsidian") or {}
+    if isinstance(obsidian_cfg, dict):
+        vn = obsidian_cfg.get("vault_name")
+        if isinstance(vn, str) and vn.strip():
+            OBSIDIAN_VAULT_NAME = vn.strip()
+        else:
+            OBSIDIAN_VAULT_NAME = None
 
     llm_cfg = cfg.get("llm") or {}
     if isinstance(llm_cfg, dict):
@@ -146,6 +182,19 @@ def apply_app_config(cfg: dict[str, Any]) -> None:
         names = [str(x).strip() for x in vault_section["exclude_dir_names"] if str(x).strip()]
         if names:
             VAULT_EXCLUDE_DIR_NAMES = frozenset(names)
+
+    chat_cfg = cfg.get("chat") or {}
+    if isinstance(chat_cfg, dict):
+        if chat_cfg.get("history_max_pairs") is not None:
+            CHAT_HISTORY_MAX_PAIRS = max(0, min(32, int(chat_cfg["history_max_pairs"])))
+        if chat_cfg.get("retrieval_history_pairs") is not None:
+            CHAT_RETRIEVAL_HISTORY_PAIRS = max(0, min(16, int(chat_cfg["retrieval_history_pairs"])))
+        if chat_cfg.get("max_history_chars") is not None:
+            CHAT_MAX_HISTORY_CHARS = max(500, min(100_000, int(chat_cfg["max_history_chars"])))
+        if isinstance(chat_cfg.get("db_path"), str) and chat_cfg["db_path"].strip():
+            CHAT_DB_PATH = (BASE_DIR / chat_cfg["db_path"].strip()).resolve()
+        if chat_cfg.get("suggest_edit_max_tokens") is not None:
+            VAULT_EDIT_MAX_TOKENS = max(32, min(512, int(chat_cfg["suggest_edit_max_tokens"])))
 
 
 def _venv_consistency_warning() -> None:
@@ -795,14 +844,249 @@ def retrieve_context_documents(
     top_k: int | None = None,
 ) -> list[Document]:
     """Same retrieval policy as build_retrieval_chain (for API streaming without duplicating chain wiring)."""
+    return [d for d, _ in retrieve_context_documents_scored(vectorstore, question, top_k=top_k)]
+
+
+def retrieve_context_documents_scored(
+    vectorstore: Chroma,
+    question: str,
+    *,
+    top_k: int | None = None,
+    chroma_where: dict[str, Any] | None = None,
+    tag_filter: str | None = None,
+) -> list[tuple[Document, float]]:
+    """
+    Vector search with optional Chroma metadata filter (e.g. vault_rel_path) and optional tag substring filter.
+    Returns (document, distance) where distance is Chroma L2 — lower is a closer match.
+    """
     k = top_k if top_k is not None else RETRIEVAL_TOP_K
-    retriever = vectorstore.as_retriever(search_kwargs={"k": k})
-    return retriever.invoke(question)
+    tag_f = (tag_filter or "").strip()
+    fetch_k = min(k * 6, 80) if tag_f else k
+
+    pairs: list[tuple[Document, float]]
+    try:
+        if chroma_where:
+            pairs = vectorstore.similarity_search_with_score(
+                question, k=fetch_k, filter=chroma_where
+            )
+        else:
+            pairs = vectorstore.similarity_search_with_score(question, k=fetch_k)
+    except TypeError:
+        pairs = vectorstore.similarity_search_with_score(question, k=fetch_k)
+        if chroma_where:
+
+            def _meta_ok(doc: Document) -> bool:
+                m = doc.metadata or {}
+                for key, val in chroma_where.items():
+                    if str(m.get(key)) != str(val):
+                        return False
+                return True
+
+            pairs = [p for p in pairs if _meta_ok(p[0])][:fetch_k]
+
+    if not tag_f:
+        return pairs[:k]
+
+    out: list[tuple[Document, float]] = []
+    needle = tag_f.lower()
+    for doc, dist in pairs:
+        tags = (doc.metadata or {}).get("tags") or ""
+        if needle in tags.lower():
+            out.append((doc, dist))
+        if len(out) >= k:
+            break
+    return out
 
 
 def documents_context_string(documents: list[Document]) -> str:
     """Join retrieved chunk texts for the LLM context window."""
     return "\n\n".join(d.page_content for d in documents)
+
+
+def documents_context_with_neighbor_section(primary: list[Document], neighbors: list[Document]) -> str:
+    """Primary retrieval chunks plus optional one-hop wikilink neighbors (clearly labeled)."""
+    base = documents_context_string(primary)
+    if not neighbors:
+        return base
+    extra = documents_context_string(neighbors)
+    return (
+        base
+        + "\n\n---\nLinked vault notes (one hop via [[wikilink]] from retrieved chunks; "
+        "treat as supplementary context only):\n\n"
+        + extra
+    )
+
+
+def expand_docs_via_wikilink_neighbors(
+    vault_dir: Path,
+    seed_docs: list[Document],
+    *,
+    max_neighbor_notes: int,
+    max_neighbor_chunks: int,
+    exclude_dir_names: frozenset[str],
+) -> list[Document]:
+    """
+    Load extra chunks from notes linked by [[wikilinks]] to/from the primary retrieval hits
+    (local graph neighborhood only — not the full vault).
+    """
+    if max_neighbor_notes <= 0 or max_neighbor_chunks <= 0:
+        return []
+
+    data = build_vault_link_graph(vault_dir, exclude_dir_names=exclude_dir_names)
+    edges = data.get("edges") or []
+
+    seed_paths: set[str] = set()
+    for d in seed_docs:
+        meta = d.metadata or {}
+        p = meta.get("vault_rel_path") or meta.get("source_file") or _vault_rel_path_from_chunk_text(
+            d.page_content
+        )
+        if p:
+            seed_paths.add(str(p).replace("\\", "/"))
+
+    if not seed_paths:
+        return []
+
+    neighbor_ids: list[str] = []
+    seen: set[str] = set()
+    for e in edges:
+        fr = e.get("from")
+        to = e.get("to")
+        if fr in seed_paths and to not in seed_paths and to not in seen:
+            neighbor_ids.append(to)
+            seen.add(to)
+        if to in seed_paths and fr not in seed_paths and fr not in seen:
+            neighbor_ids.append(fr)
+            seen.add(fr)
+        if len(neighbor_ids) >= max_neighbor_notes * 4:
+            break
+
+    neighbor_ids = neighbor_ids[:max_neighbor_notes]
+
+    out_docs: list[Document] = []
+    vault_resolved = vault_dir.resolve()
+    for rel in neighbor_ids:
+        if len(out_docs) >= max_neighbor_chunks:
+            break
+        path = (vault_dir / rel).resolve()
+        try:
+            path.relative_to(vault_resolved)
+        except ValueError:
+            continue
+        if not path.is_file():
+            continue
+        for ch in _md_file_to_documents(path, vault_dir):
+            if len(out_docs) >= max_neighbor_chunks:
+                break
+            meta = dict(ch.metadata or {})
+            meta["context_expand"] = "wikilink_neighbor"
+            out_docs.append(
+                Document(page_content=ch.page_content, metadata=_clean_metadata(meta))
+            )
+
+    return out_docs
+
+
+def build_obsidian_open_uri(vault_root: Path | None, vault_rel_path: str | None) -> str | None:
+    """Desktop Obsidian URI — set obsidian.vault_name in config, or falls back to absolute file path."""
+    if not vault_rel_path or vault_root is None:
+        return None
+    rel = str(vault_rel_path).replace("\\", "/")
+    if OBSIDIAN_VAULT_NAME:
+        return "obsidian://open?vault=" + quote(OBSIDIAN_VAULT_NAME) + "&file=" + quote(rel)
+    abs_path = (vault_root / rel).resolve()
+    return "obsidian://open?path=" + quote(str(abs_path))
+
+
+def linear_roles_to_pairs(linear: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Chronological (role, text) rows -> (user, assistant) pairs; skips orphan lines."""
+    pairs: list[tuple[str, str]] = []
+    i = 0
+    while i < len(linear):
+        role, text = linear[i]
+        if role == "user" and i + 1 < len(linear) and linear[i + 1][0] == "assistant":
+            pairs.append((text, linear[i + 1][1]))
+            i += 2
+        else:
+            i += 1
+    return pairs
+
+
+def take_last_pairs(pairs: list[tuple[str, str]], n: int) -> list[tuple[str, str]]:
+    if n <= 0 or not pairs:
+        return []
+    return pairs[-n:]
+
+
+def format_pairs_for_prompt(pairs: list[tuple[str, str]], max_chars: int) -> str:
+    """Plain-text block for the model (trimmed by character budget)."""
+    if not pairs:
+        return ""
+    lines: list[str] = []
+    for u, a in pairs:
+        lines.append(f"User: {u.strip()}")
+        lines.append(f"Assistant: {a.strip()}")
+    text = "\n".join(lines)
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def build_retrieval_query_from_history(
+    current_question: str,
+    prior_linear_messages: list[tuple[str, str]],
+    *,
+    retrieval_pairs: int,
+) -> str:
+    """
+    Augment the Chroma query with recent dialog so short follow-ups ('that note', 'expand')
+    still retrieve relevant vault chunks.
+    """
+    q = current_question.strip()
+    if retrieval_pairs <= 0:
+        return q
+    pairs = linear_roles_to_pairs(prior_linear_messages)
+    tail = take_last_pairs(pairs, retrieval_pairs)
+    if not tail:
+        return q
+    conv = "\n".join(f"User: {u}\nAssistant: {a}" for u, a in tail)
+    return f"{conv}\n\nFollow-up question:\n{q}"
+
+
+def build_hf_chat_messages_with_vault_context(
+    user_question: str,
+    doc_context: str,
+    history_block: str,
+) -> list[dict[str, str]]:
+    """Web/SSE prompt: optional dialog block + vault excerpts + current question."""
+    parts: list[str] = []
+    hb = (history_block or "").strip()
+    if hb:
+        parts.append(
+            "Recent conversation (for pronouns and follow-ups only; not a verified knowledge source):\n" + hb
+        )
+    parts.append("Relevant excerpts from your Obsidian vault:\n" + (doc_context or "").strip())
+    parts.append("Current question:\n" + (user_question or "").strip())
+    user_content = "\n\n".join(parts)
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def build_chat_prompt_text_with_vault_context(
+    tokenizer: Any,
+    user_question: str,
+    doc_context: str,
+    history_block: str,
+) -> str:
+    """Single prompt string for streaming when dialog history is available."""
+    msgs = build_hf_chat_messages_with_vault_context(user_question, doc_context, history_block)
+    return tokenizer.apply_chat_template(
+        msgs,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
 
 def build_hf_chat_messages(user_question: str, context: str) -> list[dict[str, str]]:
@@ -839,26 +1123,127 @@ def _vault_rel_path_from_chunk_text(page_content: str | None) -> str | None:
     return m.group(1).strip().replace("\\", "/")
 
 
-def serialize_sources_for_ui(documents: list[Document]) -> list[dict[str, Any]]:
-    """Compact JSON for the web UI / SSE \"sources\" event."""
+def serialize_sources_for_ui(
+    scored_documents: list[Document] | list[tuple[Document, float | None]],
+    *,
+    vault_root: Path | None = None,
+    include_scores: bool = True,
+) -> list[dict[str, Any]]:
+    """Compact JSON for the web UI / SSE \"sources\" event (optional Chroma distances + Obsidian URIs)."""
+    rows: list[tuple[Document, float | None]] = []
+    for item in scored_documents:
+        if isinstance(item, tuple):
+            rows.append((item[0], item[1]))
+        else:
+            rows.append((item, None))
+
     out: list[dict[str, Any]] = []
-    for d in documents:
+    for d, dist in rows:
         meta = d.metadata or {}
         graph_id = meta.get("vault_rel_path") or meta.get("source_file")
         if not graph_id:
             graph_id = _vault_rel_path_from_chunk_text(d.page_content)
-        out.append(
-            {
-                "graph_id": graph_id,
-                "source_file": meta.get("source_file") or graph_id,
-                "vault_rel_path": meta.get("vault_rel_path") or graph_id,
-                "label": meta.get("source_title")
-                or meta.get("title")
-                or meta.get("question"),
-                "preview": (d.page_content or "")[:240].replace("\n", " "),
-            }
-        )
+        row: dict[str, Any] = {
+            "graph_id": graph_id,
+            "source_file": meta.get("source_file") or graph_id,
+            "vault_rel_path": meta.get("vault_rel_path") or graph_id,
+            "label": meta.get("source_title") or meta.get("title") or meta.get("question"),
+            "preview": (d.page_content or "")[:240].replace("\n", " "),
+            "context_expand": meta.get("context_expand"),
+        }
+        if include_scores and dist is not None:
+            row["distance"] = float(dist)
+            row["match_hint"] = "Chroma vector distance (L2) — lower values are closer semantic matches."
+        uri = build_obsidian_open_uri(vault_root, graph_id)
+        if uri:
+            row["obsidian_uri"] = uri
+        out.append(row)
     return out
+
+
+def generate_text_non_stream(
+    tokenizer: Any,
+    pipe: Any,
+    prompt_text: str,
+    *,
+    max_new_tokens: int,
+) -> str:
+    """Single-shot generation for short JSON / auxiliary outputs (no streaming)."""
+    import torch
+
+    model = pipe.model
+    enc = tokenizer(prompt_text, return_tensors="pt")
+    device = next(model.parameters()).device
+    enc = {key: val.to(device) for key, val in enc.items()}
+    input_len = enc["input_ids"].shape[1]
+    with torch.inference_mode():
+        out_ids = model.generate(
+            **enc,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    gen_ids = out_ids[0, input_len:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+
+def parse_vault_edit_json(raw: str) -> dict[str, str] | None:
+    """Parse {\"path\": \"...\", \"markdown\": \"...\"} from model output."""
+    text = raw.strip()
+    if "```" in text:
+        parts = text.split("```")
+        for block in parts:
+            b = block.strip()
+            if b.startswith("{") or b.startswith("json"):
+                if b.startswith("json"):
+                    b = b.split("\n", 1)[-1] if "\n" in b else b
+                text = b
+                break
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            path = str(data.get("path") or "").strip()
+            md = str(data.get("markdown") or "").strip()
+            return {"path": path, "markdown": md}
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+def generate_vault_edit_suggestion(
+    tokenizer: Any,
+    pipe: Any,
+    *,
+    question: str,
+    vault_excerpts: str,
+    assistant_answer: str,
+) -> dict[str, str] | None:
+    """Second short generation: structured suggestion for a vault patch (optional UX)."""
+    vault_excerpts = (vault_excerpts or "")[:6000]
+    assistant_answer = (assistant_answer or "")[:4000]
+    sys_msg = (
+        "Reply with one JSON object only (no markdown fences, no extra text). "
+        'Keys: "path" (vault-relative .md path or ""), '
+        '"markdown" (markdown snippet to append under a ## heading, or "").'
+    )
+    user_msg = (
+        f"User question:\n{question}\n\nVault excerpts:\n{vault_excerpts}\n\n"
+        f"Assistant draft answer:\n{assistant_answer}\n\n"
+        "If a concrete vault edit helps, fill path and markdown; otherwise use empty strings."
+    )
+    msgs = [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}]
+    prompt_text = tokenizer.apply_chat_template(
+        msgs,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    raw = generate_text_non_stream(
+        tokenizer,
+        pipe,
+        prompt_text,
+        max_new_tokens=VAULT_EDIT_MAX_TOKENS,
+    )
+    return parse_vault_edit_json(raw)
 
 
 def _stream_generation_kw(tokenizer: Any, streamer: Any) -> dict[str, Any]:

@@ -11,6 +11,21 @@ models:
 
 retrieval:
   top_k: 4
+  # After vector hits, add chunks from [[wikilink]] neighbor notes (local graph only).
+  graph_expand_max_notes: 3
+  graph_expand_max_chunks: 8
+
+# Optional: Obsidian app deep links (obsidian://open?vault=...&file=...). Leave empty to use absolute file path.
+obsidian:
+  vault_name: ""
+
+# Web UI: SQLite chat history + dialog-aware retrieval (follow-ups). Paths relative to project root.
+chat:
+  db_path: .rag_chat.sqlite
+  history_max_pairs: 6
+  retrieval_history_pairs: 2
+  max_history_chars: 8000
+  suggest_edit_max_tokens: 192
 
 # Generation speed vs quality (web chat + CLI). Greedy (do_sample: false) is faster than sampling.
 # Install CUDA-enabled PyTorch so the LLM runs on GPU — CPU inference is much slower.
@@ -31,7 +46,8 @@ retrieval:
 
 prompt:
   system: |
-    You are a precise assistant. Answer questions STRICTLY using only the provided document context below (Markdown notes from the vault).
+    You are a precise assistant for an Obsidian vault. Answer questions STRICTLY using only the "Relevant excerpts from your Obsidian vault" section in the user message.
+    A "Recent conversation" section may appear for follow-up phrasing only — it is NOT a verified source of facts.
     Do not invent facts or use outside knowledge.
-    If the answer is not in the context, reply exactly: I could not find this in the documents.
-    If the fragment metadata includes a source (title or path), mention it briefly at the end of your answer.
+    If the answer is not in the vault excerpts, reply exactly: I could not find this in the documents.
+    If an excerpt includes a note title or path, mention it briefly at the end of your answer.

@@ -18,6 +18,11 @@ build/
 # Local RAG / downloads (large)
 chroma_db/
 
+# Web UI chat persistence (SQLite WAL + journal live next to this file)
+.rag_chat.sqlite
+.rag_chat.sqlite-shm
+.rag_chat.sqlite-wal
+
 # Hugging Face / PyTorch cache when HF_HOME points at project (see scripts/setup_venv.ps1)
 .cache/
 
